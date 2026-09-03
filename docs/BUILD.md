@@ -43,6 +43,17 @@ go build -o wx_channel.exe
 # 编译完成后会生成 wx_channel.exe
 ```
 
+### 本地 SunnyNet 依赖说明
+
+项目仓库已经内置 `SunnyNet v1.0.3` 源码，路径为 `pkg/sunnynet`。
+根模块通过 `go.mod` 中的 `replace github.com/qtgolang/SunnyNet => ./pkg/sunnynet` 使用这份本地代码。
+
+这意味着：
+
+- 开发者无需额外单独下载 `SunnyNet v1.0.3`
+- 执行 `go mod tidy`、`go mod vendor` 后，会继续使用仓库内的 `pkg/sunnynet`
+- 如果你更新了 `pkg/sunnynet`，记得同步执行一次 `go mod tidy` 和 `go mod vendor`
+
 ### 3. 运行程序
 
 ```bash
@@ -144,16 +155,17 @@ go build -ldflags="-s -w" -o wx_channel.exe
 
 ## 完整打包流程
 
-### 标准打包流程
+### 标准单包构建流程
 
 ```bash
 # 1. 清理旧文件
-rm -f wx_channel.exe
+rm -f wx_channel.exe wx_channel_cloud.exe
 rm -f rsrc_windows_*.syso
 
 # 2. 更新依赖（可选）
 go mod tidy
 go mod download
+go mod vendor
 
 # 3. 修改版本信息（如果需要）
 # 编辑 winres/winres.json
@@ -166,6 +178,53 @@ go build -ldflags="-s -w" -o wx_channel.exe
 
 # 6. 验证编译结果
 ./wx_channel.exe --version
+```
+
+### 三版本打包流程（推荐）
+
+项目已提供三版本脚本：
+
+- `wx_channel.exe`：普通版，构建时 `cloud_enabled=false`、`radar_enabled=false`
+- `wx_channel_cloud.exe`：Hub 版，构建时 `cloud_enabled=true`、`radar_enabled=false`
+- `wx_channel_radar.exe`：雷达版，构建时 `cloud_enabled=false`、`radar_enabled=true`
+
+脚本路径：
+
+```powershell
+.\scripts\build-variants.ps1
+```
+
+脚本执行内容：
+
+1. 运行 `go-winres make` 生成 Windows 资源
+2. 读取 `internal/version/version.go` 作为发版目录名，例如 `release/v5.6.6/`
+3. 临时修改 `internal/config/config.go` 中的 `viper.SetDefault("cloud_enabled", ...)` 与 `viper.SetDefault("radar_enabled", ...)`
+4. 使用 `go build -mod=vendor -ldflags="-w -s -extldflags '-static'"` 依次打包 Hub 版、普通版、雷达版
+5. 为每个版本生成独立目录和 ZIP 压缩包
+6. 结束后自动恢复 `config.go` 原始内容
+
+运行方式：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-variants.ps1
+```
+
+输出文件：
+
+- `release/v<version>/wx_channel_v<version>.exe`
+- `release/v<version>/wx_channel_v<version>.zip`
+- `wx_channel_cloud.exe`
+- `wx_channel.exe`
+- `wx_channel_radar.exe`
+- `release/v<version>/wx_channel_cloud_v<version>.exe`
+- `release/v<version>/wx_channel_cloud_v<version>.zip`
+- `release/v<version>/wx_channel_radar_v<version>.exe`
+- `release/v<version>/wx_channel_radar_v<version>.zip`
+
+如果你只需要普通版 + Hub 版，仓库仍保留原来的双包脚本：
+
+```powershell
+.\scripts\build-dual.ps1
 ```
 
 ### 发布版本打包
@@ -238,51 +297,16 @@ pause
 
 ### PowerShell 脚本
 
-创建 `build.ps1` 文件：
+当前推荐直接使用仓库内置双包脚本：
 
 ```powershell
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "微信视频号下载助手 - 构建脚本" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-Write-Host "[1/4] 清理旧文件..." -ForegroundColor Yellow
-Remove-Item -Path "wx_channel.exe" -ErrorAction SilentlyContinue
-Remove-Item -Path "rsrc_windows_*.syso" -ErrorAction SilentlyContinue
-
-Write-Host "[2/4] 生成 Windows 资源..." -ForegroundColor Yellow
-go-winres make
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "错误: 资源生成失败" -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "[3/4] 编译程序..." -ForegroundColor Yellow
-go build -ldflags="-s -w" -o wx_channel.exe
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "错误: 编译失败" -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "[4/4] 验证编译结果..." -ForegroundColor Yellow
-.\wx_channel.exe --version
-
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "构建完成！" -ForegroundColor Green
-Write-Host "输出文件: wx_channel.exe" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
+powershell -ExecutionPolicy Bypass -File .\scripts\build-dual.ps1
 ```
 
-运行脚本：
+输出文件：
 
-```powershell
-# 允许执行脚本（首次使用）
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# 运行构建脚本
-.\build.ps1
-```
+- `wx_channel_cloud.exe`
+- `wx_channel.exe`
 
 ### Linux/macOS Shell 脚本
 

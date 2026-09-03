@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"wx_channel/internal/config"
@@ -14,14 +13,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// QueueService handles download queue management operations
+// QueueService 处理下载队列管理操作
 type QueueService struct {
 	repo     *database.QueueRepository
 	settings *database.SettingsRepository
-	mu       sync.RWMutex
 }
 
-// NewQueueService creates a new QueueService
+// NewQueueService 创建一个新的 QueueService
 func NewQueueService() *QueueService {
 	return &QueueService{
 		repo:     database.NewQueueRepository(),
@@ -29,7 +27,7 @@ func NewQueueService() *QueueService {
 	}
 }
 
-// VideoInfo represents video information for adding to queue
+// VideoInfo 表示要添加到队列的视频信息
 type VideoInfo struct {
 	VideoID    string `json:"videoId"`
 	Title      string `json:"title"`
@@ -40,20 +38,19 @@ type VideoInfo struct {
 	Duration   int64  `json:"duration"`
 	Resolution string `json:"resolution"`
 	Size       int64  `json:"size"`
+	CreateTime string `json:"createTime,omitempty"`
 }
 
-// AddToQueue adds videos to the download queue
+// AddToQueue 将视频添加到下载队列
 func (s *QueueService) AddToQueue(videos []VideoInfo) ([]database.QueueItem, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// Load settings for chunk size
+	// 加载设置以获取分片大小
 	settings, err := s.settings.Load()
 	if err != nil {
 		settings = database.DefaultSettings()
 	}
 
-	// Get current max priority
+	// 获取当前最大优先级
 	items, err := s.repo.List()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue items: %w", err)
@@ -69,7 +66,7 @@ func (s *QueueService) AddToQueue(videos []VideoInfo) ([]database.QueueItem, err
 	now := time.Now()
 
 	for i, video := range videos {
-		// Calculate chunks
+		// 计算分片
 		chunkSize := settings.ChunkSize
 		chunksTotal := CalculateChunkCount(video.Size, chunkSize)
 
@@ -86,7 +83,7 @@ func (s *QueueService) AddToQueue(videos []VideoInfo) ([]database.QueueItem, err
 			TotalSize:       video.Size,
 			DownloadedSize:  0,
 			Status:          database.QueueStatusPending,
-			Priority:        maxPriority + len(videos) - i, // Higher priority for earlier items
+			Priority:        maxPriority + len(videos) - i, // 较早的项目优先级更高
 			AddedTime:       now,
 			Speed:           0,
 			ChunkSize:       chunkSize,
@@ -104,28 +101,21 @@ func (s *QueueService) AddToQueue(videos []VideoInfo) ([]database.QueueItem, err
 	return addedItems, nil
 }
 
-
-// RemoveFromQueue removes an item from the queue
-// Note: This does not delete any partial download data (per requirement 10.5)
+// RemoveFromQueue 从队列中移除项目
+// 注意：根据需求 10.5，这不会删除任何部分下载数据
 func (s *QueueService) RemoveFromQueue(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.Remove(id)
 }
 
-// RemoveMany removes multiple items from the queue
+// RemoveMany 从队列中批量移除项目
 func (s *QueueService) RemoveMany(ids []string) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.RemoveMany(ids)
 }
 
-// Pause pauses a downloading item
+// Pause 暂停正在下载的项目
 func (s *QueueService) Pause(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	item, err := s.repo.GetByID(id)
 	if err != nil {
@@ -135,7 +125,7 @@ func (s *QueueService) Pause(id string) error {
 		return fmt.Errorf("queue item not found: %s", id)
 	}
 
-	// Can only pause downloading items
+	// 只能暂停正在下载的项目
 	if item.Status != database.QueueStatusDownloading {
 		return fmt.Errorf("can only pause downloading items, current status: %s", item.Status)
 	}
@@ -143,10 +133,8 @@ func (s *QueueService) Pause(id string) error {
 	return s.repo.UpdateStatus(id, database.QueueStatusPaused)
 }
 
-// Resume resumes a paused item
+// Resume 恢复暂停的项目
 func (s *QueueService) Resume(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	item, err := s.repo.GetByID(id)
 	if err != nil {
@@ -156,7 +144,7 @@ func (s *QueueService) Resume(id string) error {
 		return fmt.Errorf("queue item not found: %s", id)
 	}
 
-	// Can only resume paused items
+	// 只能恢复暂停的项目
 	if item.Status != database.QueueStatusPaused {
 		return fmt.Errorf("can only resume paused items, current status: %s", item.Status)
 	}
@@ -164,18 +152,14 @@ func (s *QueueService) Resume(id string) error {
 	return s.repo.UpdateStatus(id, database.QueueStatusPending)
 }
 
-// Reorder reorders the queue based on the provided order of IDs
+// Reorder 根据提供的 ID 顺序重新排序队列
 func (s *QueueService) Reorder(ids []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.Reorder(ids)
 }
 
-// SetPriority sets the priority of a queue item
+// SetPriority 设置队列项目的优先级
 func (s *QueueService) SetPriority(id string, priority int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	item, err := s.repo.GetByID(id)
 	if err != nil {
@@ -189,58 +173,49 @@ func (s *QueueService) SetPriority(id string, priority int) error {
 	return s.repo.Update(item)
 }
 
-// GetQueue returns all queue items sorted by priority
+// GetQueue 返回按优先级排序的所有队列项目
 func (s *QueueService) GetQueue() ([]database.QueueItem, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	return s.repo.List()
 }
 
-// GetByID returns a queue item by ID
+// GetByID 按 ID 返回队列项目
 func (s *QueueService) GetByID(id string) (*database.QueueItem, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	return s.repo.GetByID(id)
 }
 
-// GetByStatus returns queue items with a specific status
+// GetByVideoID 根据 VideoID 返回队列项目
+func (s *QueueService) GetByVideoID(videoID string) (*database.QueueItem, error) {
+	return s.repo.GetByVideoID(videoID)
+}
+
+// GetByStatus 返回具有特定状态的队列项目
 func (s *QueueService) GetByStatus(status string) ([]database.QueueItem, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	return s.repo.ListByStatus(status)
 }
 
-// GetNextPending returns the next pending item to download
+// GetNextPending 返回下一个待下载的项目
 func (s *QueueService) GetNextPending() (*database.QueueItem, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	return s.repo.GetNextPending()
 }
 
-// UpdateProgress updates the download progress of a queue item
+// UpdateProgress 更新队列项目的下载进度
 func (s *QueueService) UpdateProgress(id string, downloadedSize int64, chunksCompleted int, speed int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.UpdateProgress(id, downloadedSize, chunksCompleted, speed)
 }
 
-// UpdateStatus updates the status of a queue item
+// UpdateStatus 更新队列项目的状态
 func (s *QueueService) UpdateStatus(id string, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.UpdateStatus(id, status)
 }
 
-// StartDownload marks an item as downloading and sets the start time
+// StartDownload 标记项目为正在下载并设置开始时间
 func (s *QueueService) StartDownload(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err := s.repo.UpdateStatus(id, database.QueueStatusDownloading); err != nil {
 		return err
@@ -248,10 +223,8 @@ func (s *QueueService) StartDownload(id string) error {
 	return s.repo.SetStartTime(id, time.Now())
 }
 
-// CompleteDownload marks an item as completed and creates a download record
+// CompleteDownload 标记项目为完成并创建下载记录
 func (s *QueueService) CompleteDownload(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	item, err := s.repo.GetByID(id)
 	if err != nil {
@@ -261,9 +234,9 @@ func (s *QueueService) CompleteDownload(id string) error {
 		return fmt.Errorf("queue item not found: %s", id)
 	}
 
-	// Check if already completed to avoid duplicate records
+	// 检查是否已完成以避免重复记录
 	if item.Status == database.QueueStatusCompleted {
-		// Already completed, no need to create another record
+		// 已完成，无需再次创建记录
 		return nil
 	}
 
@@ -276,13 +249,32 @@ func (s *QueueService) CompleteDownload(id string) error {
 		return err
 	}
 
-	// Calculate file path based on batch download convention
-	// Path format: {baseDir}/downloads/{authorFolder}/{cleanFilename}.mp4
-	filePath := calculateDownloadFilePath(item.Author, item.Title)
+	// 根据批量下载约定计算文件路径
+	// 路径格式: {baseDir}/downloads/{authorFolder}/{cleanFilename}.mp4
+	filePath := calculateDownloadFilePath(item)
 
-	// Create download record
+	downloadRepo := database.NewDownloadRecordRepository()
+
+	// 检查是否已经存在该视频的下载记录 (由 batch.go 等其他流程创建)
+	if existingRecord, _ := downloadRepo.GetByVideoID(item.VideoID); existingRecord != nil {
+		// 已存在记录，仅需确保状态为完成，不需要新建
+		if existingRecord.Status != database.DownloadStatusCompleted {
+			existingRecord.Status = database.DownloadStatusCompleted
+			existingRecord.FilePath = filePath
+			_ = downloadRepo.Update(existingRecord)
+		}
+		return nil
+	}
+
+	// 使用 VideoID 作为主键ID (如果有)，否则使用 UUID，确保与 batch.go 行为一致，触发 REPLACE 逻辑
+	recordID := item.VideoID
+	if recordID == "" {
+		recordID = uuid.New().String()
+	}
+
+	// 创建全新的下载记录
 	downloadRecord := &database.DownloadRecord{
-		ID:           uuid.New().String(),
+		ID:           recordID,
 		VideoID:      item.VideoID,
 		Title:        item.Title,
 		Author:       item.Author,
@@ -291,157 +283,110 @@ func (s *QueueService) CompleteDownload(id string) error {
 		FileSize:     item.TotalSize,
 		FilePath:     filePath,
 		Format:       "mp4",
-		Resolution:   item.Resolution, // Use resolution from queue item
+		Resolution:   item.Resolution, // 使用队列项目中的分辨率
 		Status:       database.DownloadStatusCompleted,
 		DownloadTime: time.Now(),
 	}
 
-	downloadRepo := database.NewDownloadRecordRepository()
 	if err := downloadRepo.Create(downloadRecord); err != nil {
-		// Log error but don't fail the completion
+		// 记录错误但不失败完成
 		fmt.Printf("Warning: failed to create download record: %v\n", err)
 	}
 
 	return nil
 }
 
-// calculateDownloadFilePath calculates the expected file path for a downloaded video
-func calculateDownloadFilePath(author, title string) string {
-	// Get download directory from current configuration
+// calculateDownloadFilePath 计算下载视频的预期文件路径
+func calculateDownloadFilePath(item *database.QueueItem) string {
+	// 从当前配置获取下载目录
 	cfg := config.Get()
 	var downloadsDir string
 	var err error
-	
+
 	if cfg != nil {
 		downloadsDir, err = cfg.GetResolvedDownloadsDir()
 	}
-	
+
 	if err != nil || downloadsDir == "" {
-		// Fallback to software base directory + downloads
+		// 回退到软件基础目录 + downloads
 		baseDir, baseErr := utils.GetBaseDir()
 		if baseErr != nil {
 			baseDir = "."
 		}
 		downloadsDir = filepath.Join(baseDir, "downloads")
 	}
-	
-	// Clean author name for folder
-	authorFolder := cleanFolderName(author)
+
+	// 清理作者名作为文件夹名
+	authorFolder := utils.CleanFolderName(item.Author)
 	if authorFolder == "" {
 		authorFolder = "未知作者"
 	}
-	
-	// Clean title for filename
-	cleanTitle := cleanFilename(title)
-	if cleanTitle == "" {
-		cleanTitle = "未命名视频"
+
+	settings := loadQueueSettings()
+	includeVideoID := true
+	if settings != nil {
+		includeVideoID = settings.DownloadFilenameWithVideoID
 	}
-	
-	// Ensure .mp4 extension
-	if !strings.HasSuffix(strings.ToLower(cleanTitle), ".mp4") {
-		cleanTitle = cleanTitle + ".mp4"
+	template := ""
+	if cfg != nil {
+		template = cfg.DownloadFilenameTemplate
 	}
-	
-	// Return absolute path using the correct download directory
-	// Path format: {downloadsDir}/{author}/{title}.mp4
-	return filepath.Join(downloadsDir, authorFolder, cleanTitle)
+
+	meta := utils.VideoFilenameMeta{
+		Title:      item.Title,
+		VideoID:    item.VideoID,
+		Author:     item.Author,
+		Duration:   time.Duration(item.Duration) * time.Millisecond,
+		CreateTime: item.AddedTime,
+		SizeBytes:  item.TotalSize,
+	}
+	cleanTitle := utils.BuildVideoFilename(meta, includeVideoID, template)
+	cleanTitle = utils.EnsureExtension(cleanTitle, ".mp4")
+	requiredSuffix := ""
+	if includeVideoID && strings.TrimSpace(template) == "" {
+		requiredSuffix = utils.VideoFilenameRequiredSuffix(cleanTitle, item.VideoID)
+	}
+
+	// 使用正确的下载目录返回绝对路径
+	// 路径格式: {downloadsDir}/{author}/{title}.mp4
+	return utils.BuildDownloadFilePath(filepath.Join(downloadsDir, authorFolder), cleanTitle, requiredSuffix)
 }
 
-// cleanFolderName removes invalid characters from folder name
-func cleanFolderName(name string) string {
-	if name == "" {
-		return ""
+func loadQueueSettings() *database.Settings {
+	settings := database.DefaultSettings()
+	repo := database.NewSettingsRepository()
+	if repo == nil || repo.GetDBUnsafe() == nil {
+		return settings
 	}
-	// Remove characters that are invalid in folder names
-	invalid := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
-	result := name
-	for _, char := range invalid {
-		result = strings.ReplaceAll(result, char, "_")
+	loaded, err := repo.Load()
+	if err != nil || loaded == nil {
+		return settings
 	}
-	// Trim spaces
-	result = strings.TrimSpace(result)
-	// Windows 文件系统会自动去除文件夹名称末尾的点（.）
-	// 为了确保创建文件夹和查找路径时使用相同的名称，我们需要手动去除末尾的点
-	result = strings.TrimRight(result, ".")
-	// 如果去除末尾点后为空，返回空字符串（调用方会处理）
-	return result
+	return loaded
 }
 
-// cleanFilename removes invalid characters from filename
-func cleanFilename(name string) string {
-	if name == "" {
-		return ""
-	}
-	// Remove characters that are invalid in filenames
-	invalid := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
-	result := name
-	for _, char := range invalid {
-		result = strings.ReplaceAll(result, char, "_")
-	}
-	// Trim spaces
-	result = strings.TrimSpace(result)
-	// Limit length
-	if len(result) > 200 {
-		result = result[:200]
-	}
-	return result
-}
-
-// FailDownload marks an item as failed with an error message
+// FailDownload 标记项目为失败并附带错误消息
 func (s *QueueService) FailDownload(id string, errorMessage string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.SetError(id, errorMessage)
 }
 
-// IncrementRetryCount increments the retry count for an item
+// IncrementRetryCount 增加项目的重试计数
 func (s *QueueService) IncrementRetryCount(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.IncrementRetryCount(id)
 }
 
-// ClearQueue removes all items from the queue
+// ClearQueue 从队列中移除所有项目
 func (s *QueueService) ClearQueue() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.Clear()
 }
 
-// GetQueueStats returns queue statistics
+// GetQueueStats 返回队列统计信息
 func (s *QueueService) GetQueueStats() (*QueueStats, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	total, err := s.repo.Count()
-	if err != nil {
-		return nil, err
-	}
-
-	pending, err := s.repo.CountByStatus(database.QueueStatusPending)
-	if err != nil {
-		return nil, err
-	}
-
-	downloading, err := s.repo.CountByStatus(database.QueueStatusDownloading)
-	if err != nil {
-		return nil, err
-	}
-
-	paused, err := s.repo.CountByStatus(database.QueueStatusPaused)
-	if err != nil {
-		return nil, err
-	}
-
-	completed, err := s.repo.CountByStatus(database.QueueStatusCompleted)
-	if err != nil {
-		return nil, err
-	}
-
-	failed, err := s.repo.CountByStatus(database.QueueStatusFailed)
+	total, pending, downloading, paused, completed, failed, err := s.repo.GetQueueStats()
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +401,7 @@ func (s *QueueService) GetQueueStats() (*QueueStats, error) {
 	}, nil
 }
 
-// QueueStats represents queue statistics
+// QueueStats 表示队列统计信息
 type QueueStats struct {
 	Total       int64 `json:"total"`
 	Pending     int64 `json:"pending"`
@@ -466,8 +411,8 @@ type QueueStats struct {
 	Failed      int64 `json:"failed"`
 }
 
-// CalculateChunkCount calculates the number of chunks needed for a file
-// Formula: ceil(fileSize / chunkSize)
+// CalculateChunkCount 计算文件所需的分片数
+// 公式: ceil(fileSize / chunkSize)
 func CalculateChunkCount(fileSize, chunkSize int64) int {
 	if chunkSize <= 0 {
 		return 1
@@ -482,10 +427,8 @@ func CalculateChunkCount(fileSize, chunkSize int64) int {
 	return int(chunks)
 }
 
-// ResetRetryCount resets the retry count for a queue item
+// ResetRetryCount 重置队列项目的重试计数
 func (s *QueueService) ResetRetryCount(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	item, err := s.repo.GetByID(id)
 	if err != nil {
@@ -499,10 +442,8 @@ func (s *QueueService) ResetRetryCount(id string) error {
 	return s.repo.Update(item)
 }
 
-// UpdateItem updates a queue item
+// UpdateItem 更新队列项目
 func (s *QueueService) UpdateItem(item *database.QueueItem) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	return s.repo.Update(item)
 }

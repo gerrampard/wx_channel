@@ -2,7 +2,7 @@
 
 ## 概述
 
-微信视频号下载助手提供了一套完整的 HTTP API，支持视频下载、批量处理、评论采集等功能。
+微信视频号下载助手提供了一套完整的 HTTP API，支持视频下载、批量处理、评论列表查询等功能。
 
 ## 基础信息
 
@@ -384,41 +384,47 @@ X-Local-Auth: your_secret_token
 
 ---
 
-## 评论采集 API
+## 评论列表 API
 
-### 保存评论数据
+### 获取视频评论列表
 
-**接口**：`POST /__wx_channels_api/save_comment_data`
+**接口**：`GET /api/channels/feed/comment/list`
 
-**功能**：保存视频评论数据
+**功能**：获取指定视频的评论列表或某条评论的回复列表
 
-**请求体**：
+**查询参数**：
+
+- `object_id`：必填，视频 ID
+- `nonce_id`：获取一级评论时使用
+- `comment_id`：获取某条评论回复时使用
+- `next_marker`：分页标记，使用上一次返回的 `lastBuffer`
+
+**响应示例**：
 
 ```json
 {
-  "videoId": "video_id",
-  "videoTitle": "视频标题",
-  "comments": [
-    {
-      "commentId": "comment_id",
-      "content": "评论内容",
-      "nickname": "用户昵称",
-      "createTime": "2025-11-23 14:30:00",
-      "likeCount": 10,
-      "replyCount": 2
+  "code": 0,
+  "message": "success",
+  "data": {
+    "errCode": 0,
+    "errMsg": "ok",
+    "data": {
+      "commentInfo": [
+        {
+          "nickname": "示例用户",
+          "content": "评论内容",
+          "commentId": "14901879320262215928",
+          "replyCommentId": "0",
+          "likeCount": 131,
+          "expandCommentCount": 7
+        }
+      ],
+      "countInfo": {
+        "commentCount": 128
+      },
+      "lastBuffer": "分页标记"
     }
-  ],
-  "originalCommentCount": 100,
-  "timestamp": 1700730000000
-}
-```
-
-**响应**：
-
-```json
-{
-  "success": true,
-  "file": "downloads/comments/video_id_20251123_143000.json"
+  }
 }
 ```
 
@@ -1061,14 +1067,22 @@ downloads/
   "success": true,
   "data": {
     "downloadDir": "downloads",
+    "downloadFilenameWithVideoId": false,
+    "downloadFilenameTemplate": "{date}_{author}_{title}_{duration}",
     "chunkSize": 10485760,
     "concurrentLimit": 3,
     "autoCleanupEnabled": false,
     "autoCleanupDays": 30,
-    "maxRetries": 3
+    "maxRetries": 3,
+    "radarEnabled": false,
+    "theme": "light"
   }
 }
 ```
+
+**说明**：
+- `downloadFilenameTemplate` 和 `radarEnabled` 由服务端配置返回，用于控制台展示当前配置状态。
+- `radarEnabled` 的持久化来源是 `config.yaml`，不是数据库设置表。
 
 #### 2. 更新设置
 
@@ -1081,12 +1095,21 @@ downloads/
 ```json
 {
   "downloadDir": "downloads",
+  "downloadFilenameWithVideoId": false,
+  "downloadFilenameTemplate": "{date}_{author}_{title}_{duration}",
   "chunkSize": 10485760,
   "concurrentLimit": 3,
   "autoCleanupEnabled": true,
-  "autoCleanupDays": 30
+  "autoCleanupDays": 30,
+  "maxRetries": 3,
+  "radarEnabled": false,
+  "theme": "light"
 }
 ```
+
+**更新语义**：
+- `downloadFilenameTemplate` 和 `radarEnabled` 可出现在响应体中，但当前版本不通过该接口持久化修改。
+- 如需修改这两个配置，请直接编辑 `config.yaml` 中的 `download_filename_template` / `radar_enabled` 并重启程序。
 
 ---
 

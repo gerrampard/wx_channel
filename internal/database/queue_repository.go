@@ -7,17 +7,17 @@ import (
 	"time"
 )
 
-// QueueRepository handles download queue database operations
+// QueueRepository 处理下载队列数据库操作
 type QueueRepository struct {
 	db *sql.DB
 }
 
-// NewQueueRepository creates a new QueueRepository
+// NewQueueRepository 创建一个新的 QueueRepository
 func NewQueueRepository() *QueueRepository {
 	return &QueueRepository{db: GetDB()}
 }
 
-// Add inserts a new queue item
+// Add 插入新的队列项目
 func (r *QueueRepository) Add(item *QueueItem) error {
 	now := time.Now()
 	item.CreatedAt = now
@@ -44,7 +44,7 @@ func (r *QueueRepository) Add(item *QueueItem) error {
 	return nil
 }
 
-// GetByID retrieves a queue item by ID
+// GetByID 根据 ID 获取队列项目
 func (r *QueueRepository) GetByID(id string) (*QueueItem, error) {
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, video_url, decrypt_key, 
@@ -83,7 +83,46 @@ func (r *QueueRepository) GetByID(id string) (*QueueItem, error) {
 	return item, nil
 }
 
-// Update updates an existing queue item
+// GetByVideoID 根据 VideoID 获取队列项目
+func (r *QueueRepository) GetByVideoID(videoID string) (*QueueItem, error) {
+	query := `
+		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, video_url, decrypt_key, 
+			COALESCE(duration, 0) as duration, COALESCE(resolution, '') as resolution, total_size, downloaded_size,
+			status, priority, added_time, start_time, speed, chunk_size,
+			chunks_total, chunks_completed, retry_count, error_message,
+			created_at, updated_at
+		FROM download_queue WHERE video_id = ? LIMIT 1
+	`
+	item := &QueueItem{}
+	var startTime sql.NullTime
+	var errorMessage sql.NullString
+	var decryptKey sql.NullString
+	var coverURL sql.NullString
+	var resolution sql.NullString
+	err := r.db.QueryRow(query, videoID).Scan(
+		&item.ID, &item.VideoID, &item.Title, &item.Author, &coverURL, &item.VideoURL, &decryptKey,
+		&item.Duration, &resolution, &item.TotalSize, &item.DownloadedSize, &item.Status, &item.Priority,
+		&item.AddedTime, &startTime, &item.Speed, &item.ChunkSize,
+		&item.ChunksTotal, &item.ChunksCompleted, &item.RetryCount,
+		&errorMessage, &item.CreatedAt, &item.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get queue item by video id: %w", err)
+	}
+	if startTime.Valid {
+		item.StartTime = startTime.Time
+	}
+	item.CoverURL = coverURL.String
+	item.Resolution = resolution.String
+	item.ErrorMessage = errorMessage.String
+	item.DecryptKey = decryptKey.String
+	return item, nil
+}
+
+// Update 更新现有的队列项目
 func (r *QueueRepository) Update(item *QueueItem) error {
 	item.UpdatedAt = time.Now()
 
@@ -112,7 +151,7 @@ func (r *QueueRepository) Update(item *QueueItem) error {
 	return nil
 }
 
-// Remove removes a queue item by ID
+// Remove 根据 ID 删除队列项目
 func (r *QueueRepository) Remove(id string) error {
 	query := "DELETE FROM download_queue WHERE id = ?"
 	result, err := r.db.Exec(query, id)
@@ -126,7 +165,7 @@ func (r *QueueRepository) Remove(id string) error {
 	return nil
 }
 
-// RemoveMany removes multiple queue items by IDs
+// RemoveMany 根据 ID 删除多个队列项目
 func (r *QueueRepository) RemoveMany(ids []string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
@@ -147,7 +186,7 @@ func (r *QueueRepository) RemoveMany(ids []string) (int64, error) {
 	return result.RowsAffected()
 }
 
-// Clear removes all queue items
+// Clear 删除所有队列项目
 func (r *QueueRepository) Clear() error {
 	_, err := r.db.Exec("DELETE FROM download_queue")
 	if err != nil {
@@ -156,7 +195,7 @@ func (r *QueueRepository) Clear() error {
 	return nil
 }
 
-// List retrieves all queue items sorted by priority and added time
+// List 获取按优先级和添加时间排序的所有队列项目
 func (r *QueueRepository) List() ([]QueueItem, error) {
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, video_url, decrypt_key, 
@@ -207,7 +246,7 @@ func (r *QueueRepository) List() ([]QueueItem, error) {
 	return items, nil
 }
 
-// ListByStatus retrieves queue items with a specific status
+// ListByStatus 获取指定状态的队列项目
 func (r *QueueRepository) ListByStatus(status string) ([]QueueItem, error) {
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, video_url, decrypt_key, 
@@ -259,7 +298,7 @@ func (r *QueueRepository) ListByStatus(status string) ([]QueueItem, error) {
 	return items, nil
 }
 
-// UpdateStatus updates the status of a queue item
+// UpdateStatus 更新队列项目的状态
 func (r *QueueRepository) UpdateStatus(id string, status string) error {
 	query := "UPDATE download_queue SET status = ?, updated_at = ? WHERE id = ?"
 	result, err := r.db.Exec(query, status, time.Now(), id)
@@ -273,7 +312,7 @@ func (r *QueueRepository) UpdateStatus(id string, status string) error {
 	return nil
 }
 
-// UpdateProgress updates the download progress of a queue item
+// UpdateProgress 更新队列项目的下载进度
 func (r *QueueRepository) UpdateProgress(id string, downloadedSize int64, chunksCompleted int, speed int64) error {
 	query := `
 		UPDATE download_queue SET
@@ -291,7 +330,7 @@ func (r *QueueRepository) UpdateProgress(id string, downloadedSize int64, chunks
 	return nil
 }
 
-// Reorder updates the priority of queue items based on the new order
+// Reorder 根据新顺序更新队列项目的优先级
 func (r *QueueRepository) Reorder(ids []string) error {
 	if len(ids) == 0 {
 		return nil
@@ -322,7 +361,7 @@ func (r *QueueRepository) Reorder(ids []string) error {
 	return nil
 }
 
-// Count returns the total number of queue items
+// Count 返回队列项目的总数
 func (r *QueueRepository) Count() (int64, error) {
 	var count int64
 	err := r.db.QueryRow("SELECT COUNT(*) FROM download_queue").Scan(&count)
@@ -332,7 +371,7 @@ func (r *QueueRepository) Count() (int64, error) {
 	return count, nil
 }
 
-// CountByStatus returns the count of queue items with a specific status
+// CountByStatus 返回指定状态的队列项目数
 func (r *QueueRepository) CountByStatus(status string) (int64, error) {
 	var count int64
 	err := r.db.QueryRow("SELECT COUNT(*) FROM download_queue WHERE status = ?", status).Scan(&count)
@@ -342,7 +381,33 @@ func (r *QueueRepository) CountByStatus(status string) (int64, error) {
 	return count, nil
 }
 
-// GetNextPending retrieves the next pending queue item
+// GetQueueStats 返回队列的所有状态统计聚合
+func (r *QueueRepository) GetQueueStats() (total, pending, downloading, paused, completed, failed int64, err error) {
+	query := `
+		SELECT 
+			COUNT(*) as total,
+			SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as pending,
+			SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as downloading,
+			SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as paused,
+			SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as completed,
+			SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as failed
+		FROM download_queue
+	`
+	err = r.db.QueryRow(query,
+		QueueStatusPending,
+		QueueStatusDownloading,
+		QueueStatusPaused,
+		QueueStatusCompleted,
+		QueueStatusFailed,
+	).Scan(&total, &pending, &downloading, &paused, &completed, &failed)
+
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to get aggregated queue stats: %w", err)
+	}
+	return total, pending, downloading, paused, completed, failed, nil
+}
+
+// GetNextPending 获取下一个待处理的队列项目
 func (r *QueueRepository) GetNextPending() (*QueueItem, error) {
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, video_url, decrypt_key, 
@@ -382,7 +447,7 @@ func (r *QueueRepository) GetNextPending() (*QueueItem, error) {
 	return item, nil
 }
 
-// IncrementRetryCount increments the retry count for a queue item
+// IncrementRetryCount 增加队列项目的重试计数
 func (r *QueueRepository) IncrementRetryCount(id string) error {
 	query := "UPDATE download_queue SET retry_count = retry_count + 1, updated_at = ? WHERE id = ?"
 	result, err := r.db.Exec(query, time.Now(), id)
@@ -396,7 +461,7 @@ func (r *QueueRepository) IncrementRetryCount(id string) error {
 	return nil
 }
 
-// SetStartTime sets the start time for a queue item
+// SetStartTime 设置队列项目的开始时间
 func (r *QueueRepository) SetStartTime(id string, startTime time.Time) error {
 	query := "UPDATE download_queue SET start_time = ?, updated_at = ? WHERE id = ?"
 	result, err := r.db.Exec(query, startTime, time.Now(), id)
@@ -410,7 +475,7 @@ func (r *QueueRepository) SetStartTime(id string, startTime time.Time) error {
 	return nil
 }
 
-// SetError sets the error message for a queue item
+// SetError 设置队列项目的错误信息
 func (r *QueueRepository) SetError(id string, errorMessage string) error {
 	query := "UPDATE download_queue SET error_message = ?, status = ?, updated_at = ? WHERE id = ?"
 	result, err := r.db.Exec(query, errorMessage, QueueStatusFailed, time.Now(), id)

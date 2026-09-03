@@ -9,15 +9,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"wx_channel/internal/config"
-	"wx_channel/internal/storage"
-	"wx_channel/internal/utils"
+	"wx_channel/internal/database"
+	"wx_channel/internal/response"
+	"wx_channel/internal/services"
+	"wx_channel/internal/utils" // Import websocket package
+	"wx_channel/internal/websocket"
 	"wx_channel/pkg/util"
 
 	"github.com/fatih/color"
@@ -26,13 +31,200 @@ import (
 
 // UploadHandler 文件上传处理器
 type UploadHandler struct {
-	csvManager *storage.CSVManager
-	chunkSem   chan struct{}
-	mergeSem   chan struct{}
+	downloadService *services.DownloadRecordService
+	settingsRepo    *database.SettingsRepository
+	gopeedService   *services.GopeedService // Injected Gopeed Service
+	chunkSem        chan struct{}
+	mergeSem        chan struct{}
+	wsHub           *websocket.Hub
+	activeDownloads sync.Map // map[string]context.CancelFunc
+}
+
+type DownloadVideoRequest struct {
+	VideoURL     string            `json:"videoUrl"`
+	VideoID      string            `json:"videoId"`
+	Title        string            `json:"title"`
+	Author       string            `json:"author"`
+	SourceURL    string            `json:"sourceUrl"`
+	UserAgent    string            `json:"userAgent"`
+	Headers      map[string]string `json:"headers"`
+	Key          string            `json:"key"`          // 解密key（可选）
+	ForceSave    bool              `json:"forceSave"`    // 是否强制保存（即使文件已存在）
+	Resolution   string            `json:"resolution"`   // 分辨率字符串（如 "1080x1920" 或 "1080p"）
+	Width        int               `json:"width"`        // 视频宽度（可选）
+	Height       int               `json:"height"`       // 视频高度（可选）
+	FileFormat   string            `json:"fileFormat"`   // 文件格式（如 "hd", "sd" 等）
+	ExpectedSize int64             `json:"expectedSize"` // 原始视频大小提示（字节，可选）
+	LikeCount    int64             `json:"likeCount"`
+	CommentCount int64             `json:"commentCount"`
+	ForwardCount int64             `json:"forwardCount"`
+	FavCount     int64             `json:"favCount"`
+}
+
+type downloadVideoMode string
+
+const (
+	downloadVideoModeOriginal downloadVideoMode = "original"
+	downloadVideoModeSpecific downloadVideoMode = "specific"
+)
+
+func isOriginalVideoURL(url string) bool {
+	return strings.Contains(url, "X-snsvideoflag=original")
+}
+
+func hasSpecificVideoSpec(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	spec := strings.TrimSpace(parsed.Query().Get("X-snsvideoflag"))
+	return spec != "" && !strings.EqualFold(spec, "original")
+}
+
+func normalizeOriginalVideoURL(raw string) string {
+	if !isOriginalVideoURL(raw) {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return strings.ReplaceAll(raw, "&X-snsvideoflag=original", "")
+	}
+	query := parsed.Query()
+	if query.Get("X-snsvideoflag") == "original" {
+		query.Del("X-snsvideoflag")
+		parsed.RawQuery = query.Encode()
+	}
+	return parsed.String()
+}
+
+func NormalizeDownloadURL(videoURL string, fileFormat string) (string, downloadVideoMode) {
+	if isOriginalVideoURL(videoURL) {
+		return normalizeOriginalVideoURL(videoURL), downloadVideoModeOriginal
+	}
+	if strings.TrimSpace(fileFormat) != "" || hasSpecificVideoSpec(videoURL) {
+		return videoURL, downloadVideoModeSpecific
+	}
+	return normalizeOriginalVideoURL(videoURL), downloadVideoModeOriginal
+}
+
+func ResolveDownloadConnections(mode downloadVideoMode, base int) int {
+	if mode == downloadVideoModeOriginal {
+		return 1
+	}
+	return base
+}
+
+func downloadModeFromRequest(req DownloadVideoRequest) downloadVideoMode {
+	_, mode := NormalizeDownloadURL(req.VideoURL, req.FileFormat)
+	return mode
+}
+
+func normalizeDownloadVideoURL(req DownloadVideoRequest) string {
+	normalized, _ := NormalizeDownloadURL(req.VideoURL, req.FileFormat)
+	return normalized
+}
+
+func downloadConnectionCountFromMode(base int, mode downloadVideoMode) int {
+	return ResolveDownloadConnections(mode, base)
+}
+
+// validateOriginalDownloadSize rejects a lower-quality rendition returned for
+// an original-video request. The source hint is approximate, so the same 80%
+// tolerance used by the page-session downloader is intentional.
+func validateOriginalDownloadSize(mode downloadVideoMode, expectedSize, actualSize int64) error {
+	if mode != downloadVideoModeOriginal || expectedSize <= 0 || actualSize <= 0 {
+		return nil
+	}
+	if actualSize < expectedSize && expectedSize-actualSize > expectedSize/5 {
+		return fmt.Errorf("原始视频疑似低码率流: 期望 %.2f MB，实际 %.2f MB",
+			float64(expectedSize)/(1024*1024), float64(actualSize)/(1024*1024))
+	}
+	return nil
+}
+
+func (h *UploadHandler) downloadWithHeaders(ctx context.Context, url, targetPath string, headers map[string]string, onProgress func(progress float64, downloaded int64, total int64)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("create request failed: %w", err)
+	}
+	for k, v := range headers {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "*/*")
+	}
+	if req.Header.Get("Accept-Language") == "" {
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	}
+	if req.Header.Get("Cache-Control") == "" {
+		req.Header.Set("Cache-Control", "no-cache")
+	}
+
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	total := resp.ContentLength
+	utils.Info("📡 [视频下载] 直连响应: status=%s | length=%d | type=%s | range=%s", resp.Status, total, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Range"))
+
+	out, err := os.Create(targetPath)
+	if err != nil {
+		return fmt.Errorf("create file failed: %w", err)
+	}
+	defer out.Close()
+
+	buf := make([]byte, 256*1024)
+	var downloaded int64
+	var lastReport time.Time
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, err := out.Write(buf[:n]); err != nil {
+				return fmt.Errorf("write file failed: %w", err)
+			}
+			downloaded += int64(n)
+			if onProgress != nil {
+				now := time.Now()
+				if now.Sub(lastReport) >= 300*time.Millisecond || (total > 0 && downloaded >= total) {
+					progress := 0.0
+					if total > 0 {
+						progress = float64(downloaded) / float64(total)
+					}
+					onProgress(progress, downloaded, total)
+					lastReport = now
+				}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read response failed: %w", readErr)
+		}
+	}
+
+	if onProgress != nil {
+		progress := 0.0
+		if total > 0 {
+			progress = 1
+		}
+		onProgress(progress, downloaded, total)
+	}
+	return nil
 }
 
 // NewUploadHandler 创建上传处理器
-func NewUploadHandler(cfg *config.Config, csvManager *storage.CSVManager) *UploadHandler {
+func NewUploadHandler(cfg *config.Config, wsHub *websocket.Hub, gopeedService *services.GopeedService) *UploadHandler {
 	ch := cfg.UploadChunkConcurrency
 	if ch <= 0 {
 		ch = 4
@@ -42,9 +234,12 @@ func NewUploadHandler(cfg *config.Config, csvManager *storage.CSVManager) *Uploa
 		mg = 1
 	}
 	return &UploadHandler{
-		csvManager: csvManager,
-		chunkSem:   make(chan struct{}, ch),
-		mergeSem:   make(chan struct{}, mg),
+		downloadService: services.NewDownloadRecordService(),
+		settingsRepo:    database.NewSettingsRepository(),
+		gopeedService:   gopeedService,
+		chunkSem:        make(chan struct{}, ch),
+		mergeSem:        make(chan struct{}, mg),
+		wsHub:           wsHub,
 	}
 }
 
@@ -56,7 +251,98 @@ func (h *UploadHandler) getConfig() *config.Config {
 // getDownloadsDir 获取解析后的下载目录
 func (h *UploadHandler) getDownloadsDir() (string, error) {
 	cfg := h.getConfig()
+	if cfg == nil {
+		return "", fmt.Errorf("config is nil")
+	}
 	return cfg.GetResolvedDownloadsDir()
+}
+
+// Handle implements router.Interceptor
+func (h *UploadHandler) Handle(Conn *SunnyNet.HttpConn) bool {
+	// Critical nil check
+	if Conn == nil || Conn.Request == nil || Conn.Request.URL == nil {
+		return false
+	}
+
+	if h.HandleInitUpload(Conn) {
+		return true
+	}
+	if h.HandleUploadChunk(Conn) {
+		return true
+	}
+	if h.HandleCompleteUpload(Conn) {
+		return true
+	}
+	if h.HandleUploadStatus(Conn) {
+		return true
+	}
+	if h.HandleSaveVideo(Conn) {
+		return true
+	}
+	if h.HandleSaveCover(Conn) {
+		return true
+	}
+	if h.HandleCancelDownload(Conn) {
+		return true
+	}
+	if h.HandleDownloadVideo(Conn) {
+		return true
+	}
+	return false
+}
+
+// HandleCancelDownload 处理取消下载请求
+func (h *UploadHandler) HandleCancelDownload(Conn *SunnyNet.HttpConn) bool {
+	path := Conn.Request.URL.Path
+	if path != "/__wx_channels_api/cancel_download" {
+		return false
+	}
+
+	// 允许 POST 或 GET 请求
+	if Conn.Request.Method != "POST" && Conn.Request.Method != "GET" {
+		h.sendErrorResponse(Conn, fmt.Errorf("method not allowed: %s", Conn.Request.Method))
+		return true
+	}
+
+	var videoId string
+
+	if Conn.Request.Method == "GET" {
+		videoId = Conn.Request.URL.Query().Get("videoId")
+	} else {
+		// POST 请求解析Body
+		body, err := io.ReadAll(Conn.Request.Body)
+		if err == nil {
+			var req struct {
+				VideoID string `json:"videoId"`
+			}
+			json.Unmarshal(body, &req)
+			videoId = req.VideoID
+		}
+		_ = Conn.Request.Body.Close()
+	}
+
+	if videoId == "" {
+		h.sendErrorResponse(Conn, fmt.Errorf("missing videoId"))
+		return true
+	}
+
+	utils.Info("⏹️ [取消下载] 收到取消请求: %s", videoId)
+
+	// 查找并调用取消函数
+	if cancel, ok := h.activeDownloads.Load(videoId); ok {
+		if cancelFunc, ok := cancel.(context.CancelFunc); ok {
+			cancelFunc()
+			utils.Info("Found and executed cancel function for %s", videoId)
+		}
+		h.activeDownloads.Delete(videoId)
+		h.sendSuccessResponse(Conn)
+	} else {
+		utils.Warn("No active download found for %s to cancel", videoId)
+		// 即使没找到也返回成功，可能是已经完成了
+		h.sendSuccessResponse(Conn)
+	}
+
+	return true
 }
 
 // HandleInitUpload 处理分片上传初始化请求
@@ -135,28 +421,22 @@ func (h *UploadHandler) HandleInitUpload(Conn *SunnyNet.HttpConn) bool {
 		"success":  true,
 		"uploadId": uploadId,
 	}
-	responseBytes, err := json.Marshal(responseData)
-	if err != nil {
-		utils.HandleError(err, "生成响应JSON")
-		h.sendErrorResponse(Conn, err)
-		return true
-	}
-
-	utils.Info("✅ init_upload: 返回响应: %s", string(responseBytes))
-	h.sendJSONResponse(Conn, 200, responseBytes)
+	utils.Info("✅ init_upload: 返回响应: %v", responseData)
+	h.sendJSONResponse(Conn, 200, responseData)
 	return true
 }
 
 // HandleUploadChunk 处理分片上传请求
 func (h *UploadHandler) HandleUploadChunk(Conn *SunnyNet.HttpConn) bool {
+	path := Conn.Request.URL.Path
+	if path != "/__wx_channels_api/upload_chunk" {
+		return false
+	}
+
 	// 并发限流（分片）
 	if h.chunkSem != nil {
 		h.chunkSem <- struct{}{}
 		defer func() { <-h.chunkSem }()
-	}
-	path := Conn.Request.URL.Path
-	if path != "/__wx_channels_api/upload_chunk" {
-		return false
 	}
 
 	if h.getConfig() != nil && h.getConfig().SecretToken != "" {
@@ -351,14 +631,15 @@ func (h *UploadHandler) HandleUploadChunk(Conn *SunnyNet.HttpConn) bool {
 
 // HandleCompleteUpload 处理分片上传完成请求
 func (h *UploadHandler) HandleCompleteUpload(Conn *SunnyNet.HttpConn) bool {
+	path := Conn.Request.URL.Path
+	if path != "/__wx_channels_api/complete_upload" {
+		return false
+	}
+
 	// 并发限流（合并）
 	if h.mergeSem != nil {
 		h.mergeSem <- struct{}{}
 		defer func() { <-h.mergeSem }()
-	}
-	path := Conn.Request.URL.Path
-	if path != "/__wx_channels_api/complete_upload" {
-		return false
 	}
 
 	if h.getConfig() != nil && h.getConfig().SecretToken != "" {
@@ -442,23 +723,13 @@ func (h *UploadHandler) HandleCompleteUpload(Conn *SunnyNet.HttpConn) bool {
 	}
 
 	// 清理文件名
-	cleanFilename := utils.CleanFilename(req.Filename)
+	cleanFilename := utils.CleanFilenameForDownload(req.Filename)
 	cleanFilename = utils.EnsureExtension(cleanFilename, ".mp4")
 
 	// 冲突处理
-	base := filepath.Base(cleanFilename)
-	ext := filepath.Ext(cleanFilename)
-	baseName := strings.TrimSuffix(base, ext)
-	finalPath := filepath.Join(savePath, cleanFilename)
+	finalPath := utils.BuildDownloadFilePath(savePath, cleanFilename, "")
 	if _, err := os.Stat(finalPath); err == nil {
-		// 文件已存在，生成唯一文件名
-		for i := 1; i < 1000; i++ {
-			candidate := filepath.Join(savePath, fmt.Sprintf("%s(%d)%s", baseName, i, ext))
-			if _, existsErr := os.Stat(candidate); os.IsNotExist(existsErr) {
-				finalPath = candidate
-				break
-			}
-		}
+		finalPath = utils.GenerateUniquePath(savePath, cleanFilename)
 	}
 
 	// 合并分片
@@ -515,15 +786,8 @@ func (h *UploadHandler) HandleCompleteUpload(Conn *SunnyNet.HttpConn) bool {
 		"path":    finalPath,
 		"size":    fileSize,
 	}
-	responseBytes, err := json.Marshal(responseData)
-	if err != nil {
-		utils.HandleError(err, "生成响应JSON")
-		h.sendErrorResponse(Conn, err)
-		return true
-	}
-
-	utils.Info("✅ complete_upload: 返回响应: %s", string(responseBytes))
-	h.sendJSONResponse(Conn, 200, responseBytes)
+	utils.Info("✅ complete_upload: 返回响应: %v", responseData)
+	h.sendJSONResponse(Conn, 200, responseData)
 	return true
 }
 
@@ -588,6 +852,13 @@ func (h *UploadHandler) HandleSaveVideo(Conn *SunnyNet.HttpConn) bool {
 	filename := Conn.Request.FormValue("filename")
 	authorName := Conn.Request.FormValue("authorName")
 	isEncrypted := Conn.Request.FormValue("isEncrypted") == "true"
+	videoID := Conn.Request.FormValue("videoId")
+	title := Conn.Request.FormValue("title")
+	resolution := Conn.Request.FormValue("resolution")
+	likeCount, _ := strconv.ParseInt(Conn.Request.FormValue("likeCount"), 10, 64)
+	commentCount, _ := strconv.ParseInt(Conn.Request.FormValue("commentCount"), 10, 64)
+	forwardCount, _ := strconv.ParseInt(Conn.Request.FormValue("forwardCount"), 10, 64)
+	favCount, _ := strconv.ParseInt(Conn.Request.FormValue("favCount"), 10, 64)
 
 	// 创建作者文件夹路径
 	authorFolder := utils.CleanFolderName(authorName)
@@ -608,21 +879,14 @@ func (h *UploadHandler) HandleSaveVideo(Conn *SunnyNet.HttpConn) bool {
 	}
 
 	// 清理文件名
-	cleanFilename := utils.CleanFilename(filename)
+	cleanFilename := utils.CleanFilenameForDownload(filename)
 	cleanFilename = utils.EnsureExtension(cleanFilename, ".mp4")
+	requiredSuffix := utils.VideoFilenameRequiredSuffix(cleanFilename, videoID)
 
 	// 生成唯一文件名
-	filePath := filepath.Join(savePath, cleanFilename)
+	filePath := utils.BuildDownloadFilePath(savePath, cleanFilename, requiredSuffix)
 	if _, statErr := os.Stat(filePath); statErr == nil {
-		base := strings.TrimSuffix(cleanFilename, filepath.Ext(cleanFilename))
-		ext := filepath.Ext(cleanFilename)
-		for i := 1; i < 1000; i++ {
-			candidate := filepath.Join(savePath, fmt.Sprintf("%s(%d)%s", base, i, ext))
-			if _, existsErr := os.Stat(candidate); os.IsNotExist(existsErr) {
-				filePath = candidate
-				break
-			}
-		}
+		filePath = utils.GenerateUniquePathWithSuffix(savePath, cleanFilename, requiredSuffix)
 	}
 
 	// 保存文件
@@ -653,6 +917,31 @@ func (h *UploadHandler) HandleSaveVideo(Conn *SunnyNet.HttpConn) bool {
 	}
 	utils.Info("✓ 视频已保存: %s (%.2f MB)%s", filePath, fileSize, statusMsg)
 
+	if h.downloadService != nil {
+		record := &database.DownloadRecord{
+			ID:           videoID,
+			VideoID:      videoID,
+			Title:        title,
+			Author:       authorName,
+			FileSize:     written,
+			FilePath:     filePath,
+			Format:       "mp4",
+			Resolution:   resolution,
+			Status:       database.DownloadStatusCompleted,
+			DownloadTime: time.Now(),
+			LikeCount:    likeCount,
+			CommentCount: commentCount,
+			ForwardCount: forwardCount,
+			FavCount:     favCount,
+		}
+		if record.Title == "" {
+			record.Title = filename
+		}
+		if err := h.downloadService.Create(record); err != nil {
+			utils.Error("保存下载记录失败: %v", err)
+		}
+	}
+
 	// 记录直接上传成功
 	utils.LogDirectUpload(filename, authorName, fileSize, isEncrypted, true)
 
@@ -661,15 +950,8 @@ func (h *UploadHandler) HandleSaveVideo(Conn *SunnyNet.HttpConn) bool {
 		"path":    filePath,
 		"size":    fileSize,
 	}
-	responseBytes, err := json.Marshal(responseData)
-	if err != nil {
-		utils.HandleError(err, "生成响应JSON")
-		h.sendErrorResponse(Conn, err)
-		return true
-	}
-
-	utils.Info("✅ save_video: 返回响应: %s", string(responseBytes))
-	h.sendJSONResponse(Conn, 200, responseBytes)
+	utils.Info("✅ save_video: 返回响应: %v", responseData)
+	h.sendJSONResponse(Conn, 200, responseData)
 	return true
 }
 
@@ -766,7 +1048,7 @@ func (h *UploadHandler) HandleSaveCover(Conn *SunnyNet.HttpConn) bool {
 	// 生成文件名：使用视频标题，如果没有则使用视频ID
 	var filename string
 	if req.Title != "" {
-		filename = utils.CleanFilename(req.Title)
+		filename = utils.CleanFilenameForDownload(req.Title)
 	} else if req.VideoID != "" {
 		filename = "cover_" + req.VideoID
 	} else {
@@ -775,7 +1057,7 @@ func (h *UploadHandler) HandleSaveCover(Conn *SunnyNet.HttpConn) bool {
 
 	// 确保文件扩展名
 	filename = utils.EnsureExtension(filename, ".jpg")
-	coverPath := filepath.Join(savePath, filename)
+	coverPath := utils.BuildDownloadFilePath(savePath, filename, "")
 
 	// 检查文件是否已存在
 	if !req.ForceSave {
@@ -891,6 +1173,13 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 		return true
 	}
 
+	// check body
+	if Conn.Request.Body == nil {
+		utils.Error("Handler request body is nil")
+		h.sendErrorResponse(Conn, fmt.Errorf("request body is nil"))
+		return true
+	}
+
 	body, err := io.ReadAll(Conn.Request.Body)
 	if err != nil {
 		utils.HandleError(err, "读取download_video请求体")
@@ -899,18 +1188,7 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 	}
 	defer Conn.Request.Body.Close()
 
-	var req struct {
-		VideoURL   string `json:"videoUrl"`
-		VideoID    string `json:"videoId"`
-		Title      string `json:"title"`
-		Author     string `json:"author"`
-		Key        string `json:"key"`        // 解密key（可选）
-		ForceSave  bool   `json:"forceSave"`  // 是否强制保存（即使文件已存在）
-		Resolution string `json:"resolution"` // 分辨率字符串（如 "1080x1920" 或 "1080p"）
-		Width      int    `json:"width"`      // 视频宽度（可选）
-		Height     int    `json:"height"`     // 视频高度（可选）
-		FileFormat string `json:"fileFormat"` // 文件格式（如 "hd", "sd" 等）
-	}
+	var req DownloadVideoRequest
 
 	if err := json.Unmarshal(body, &req); err != nil {
 		utils.HandleError(err, "解析download_video JSON")
@@ -943,24 +1221,25 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 		return true
 	}
 
-	// 优先使用视频ID进行去重检查（如果提供了视频ID）
-	if !req.ForceSave && req.VideoID != "" && h.csvManager != nil {
-		if exists, err := h.csvManager.RecordExists(req.VideoID); err == nil && exists {
-			// CSV记录中已存在该视频ID，说明已下载过，跳过下载
-			utils.Info("⏭️ [视频下载] 视频ID已存在记录中，跳过下载: ID=%s", req.VideoID)
-			responseData := map[string]interface{}{
-				"success": true,
-				"skipped": true,
-				"message": "视频已下载（基于ID检查）",
-			}
-			responseBytes, _ := json.Marshal(responseData)
-			h.sendJSONResponse(Conn, 200, responseBytes)
-			return true
-		}
+	settings, err := h.settingsRepo.Load()
+	if err != nil {
+		utils.Warn("加载下载命名设置失败，继续使用默认命名策略: %v", err)
+	}
+	includeVideoID := true
+	if settings != nil {
+		includeVideoID = settings.DownloadFilenameWithVideoID
+	}
+	filenameTemplate := ""
+	if cfg := h.getConfig(); cfg != nil {
+		filenameTemplate = cfg.DownloadFilenameTemplate
 	}
 
-	// 生成文件名：优先使用视频ID确保唯一性
-	filename := utils.GenerateVideoFilename(req.Title, req.VideoID)
+	// 生成文件名：默认仅使用标题；如配置模板，则优先按模板渲染。
+	filename := utils.BuildVideoFilename(utils.VideoFilenameMeta{
+		Title:   req.Title,
+		VideoID: req.VideoID,
+		Author:  req.Author,
+	}, includeVideoID, filenameTemplate)
 
 	// 检查文件名中是否已经包含分辨率信息（避免重复添加）
 	hasResolutionInFilename := false
@@ -974,6 +1253,7 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 		hasResolutionInFilename = strings.Contains(filename, "_"+cleanResolution) || strings.Contains(filename, cleanResolution)
 	}
 
+	qualitySuffix := ""
 	// 如果有分辨率信息且文件名中还没有，添加到文件名中（与前端命名方式一致）
 	if !hasResolutionInFilename && (req.FileFormat != "" || req.Width > 0 || req.Height > 0 || req.Resolution != "") {
 		var qualityInfo string
@@ -993,6 +1273,8 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 			cleanResolution = strings.ReplaceAll(cleanResolution, "X", "x")
 			qualityInfo += "_" + cleanResolution
 		}
+		qualityInfo = utils.CleanFilenameForDownload(qualityInfo)
+		qualitySuffix = "_" + qualityInfo
 
 		// 在添加分辨率信息前，需要先移除扩展名
 		base := strings.TrimSuffix(filename, filepath.Ext(filename))
@@ -1000,268 +1282,314 @@ func (h *UploadHandler) HandleDownloadVideo(Conn *SunnyNet.HttpConn) bool {
 		if ext == "" {
 			ext = ".mp4"
 		}
-		filename = base + "_" + qualityInfo + ext
+		filename = base + qualitySuffix + ext
 		utils.Info("📐 [视频下载] 添加分辨率信息到文件名: %s", qualityInfo)
 	} else if hasResolutionInFilename {
 		utils.Info("📐 [视频下载] 文件名中已包含分辨率信息，跳过添加")
 	}
-
-	// 确保文件扩展名
-	filename = utils.EnsureExtension(filename, ".mp4")
-	videoPath := filepath.Join(savePath, filename)
-
-	// 检查文件是否已存在（作为备用检查，主要检查已通过ID完成）
-	if !req.ForceSave {
-		if stat, err := os.Stat(videoPath); err == nil {
-			// 文件已存在，返回成功但不重新下载
-			fileSize := float64(stat.Size()) / (1024 * 1024)
-			relativePath, _ := filepath.Rel(downloadsDir, videoPath)
-			utils.Info("⏭️ [视频下载] 文件已存在，跳过: %s", relativePath)
-
-			// 注意：不再手动保存下载记录，因为队列系统已经处理了记录保存
-			// 移除重复的记录调用以避免数据库中出现重复记录
-
-			responseData := map[string]interface{}{
-				"success":      true,
-				"path":         videoPath,
-				"relativePath": relativePath,
-				"size":         fileSize,
-				"skipped":      true,
-				"message":      "文件已存在，跳过下载",
+	if qualitySuffix == "" && hasResolutionInFilename {
+		// 前端可能已经带上了分辨率但没有完整的质量标识，仍保护实际存在的尾段。
+		base := strings.TrimSuffix(filename, filepath.Ext(filename))
+		resolutionSuffix := ""
+		if req.Width > 0 && req.Height > 0 {
+			resolutionSuffix = fmt.Sprintf("_%dx%d", req.Width, req.Height)
+		} else if req.Resolution != "" {
+			cleanResolution := strings.ReplaceAll(req.Resolution, " ", "")
+			cleanResolution = strings.ReplaceAll(cleanResolution, "×", "x")
+			cleanResolution = strings.ReplaceAll(cleanResolution, "X", "x")
+			resolutionSuffix = "_" + cleanResolution
+		}
+		if resolutionSuffix != "" && strings.HasSuffix(base, resolutionSuffix) {
+			qualitySuffix = resolutionSuffix
+			if req.FileFormat != "" {
+				formatSuffix := "_" + utils.CleanFilenameForDownload(req.FileFormat)
+				if strings.HasSuffix(base, formatSuffix+resolutionSuffix) {
+					qualitySuffix = formatSuffix + resolutionSuffix
+				}
 			}
-			responseBytes, _ := json.Marshal(responseData)
-			h.sendJSONResponse(Conn, 200, responseBytes)
+		} else if req.FileFormat != "" {
+			formatSuffix := "_" + utils.CleanFilenameForDownload(req.FileFormat)
+			if strings.HasSuffix(base, formatSuffix) {
+				qualitySuffix = formatSuffix
+			}
+		}
+	}
+
+	// 确保文件扩展名，并按实际作者目录动态计算可用长度。
+	filename = utils.EnsureExtension(filename, ".mp4")
+	requiredSuffix := ""
+	if qualitySuffix != "" {
+		requiredSuffix = qualitySuffix
+	}
+	if includeVideoID && strings.TrimSpace(filenameTemplate) == "" {
+		if videoIDSuffix := utils.VideoFilenameRequiredSuffix(filename, req.VideoID); videoIDSuffix != "" {
+			requiredSuffix = videoIDSuffix
+		}
+	}
+	videoPath := utils.BuildDownloadFilePath(savePath, filename, requiredSuffix)
+
+	if !req.ForceSave {
+		if req.VideoID != "" && h.downloadService != nil {
+			if existing, err := h.downloadService.GetByID(req.VideoID); err == nil && existing != nil && existing.FilePath != "" {
+				if stat, statErr := os.Stat(existing.FilePath); statErr == nil {
+					fileSize := float64(stat.Size()) / (1024 * 1024)
+					relativePath, _ := filepath.Rel(downloadsDir, existing.FilePath)
+					utils.Info("⏭️ [视频下载] 视频已存在，跳过: %s", relativePath)
+
+					responseData := map[string]interface{}{
+						"success":      true,
+						"path":         existing.FilePath,
+						"relativePath": relativePath,
+						"size":         fileSize,
+						"skipped":      true,
+						"message":      "视频已存在，跳过下载",
+					}
+					responseBytes, _ := json.Marshal(responseData)
+					h.sendJSONResponse(Conn, 200, responseBytes)
+					return true
+				}
+			}
+		}
+		videoPath = utils.GenerateUniquePathWithSuffix(savePath, filename, requiredSuffix)
+	}
+
+	if req.VideoID != "" {
+		if _, exists := h.activeDownloads.Load(req.VideoID); exists {
+			h.sendJSONResponse(Conn, 200, map[string]interface{}{
+				"success": true,
+				"started": true,
+				"message": "下载任务已在后台进行中",
+			})
 			return true
 		}
 	}
 
 	// 判断是否需要解密
 	needDecrypt := req.Key != ""
-	prefixLen := int64(131072) // 128KB 加密前缀长度
 
-	// 断点续传：检查已下载的部分
-	var resumeOffset int64 = 0
-	resumeEnabled := h.getConfig() != nil && h.getConfig().DownloadResumeEnabled
-	tmpPath := videoPath + ".tmp"
+	// 临时文件路径
+	tmpHint := req.VideoID
+	if strings.TrimSpace(tmpHint) == "" {
+		tmpHint = utils.RandomString(8)
+	}
+	tmpPath := utils.BuildTempDownloadPath(videoPath, tmpHint)
 
-	if resumeEnabled {
-		if stat, err := os.Stat(tmpPath); err == nil {
-			existingSize := stat.Size()
-			if needDecrypt {
-				// 加密视频：如果已下载 >= 128KB，可以从断点续传
-				if existingSize >= prefixLen {
-					resumeOffset = existingSize
-					utils.Info("📍 [视频下载] 加密视频断点续传，从 %.2f MB 继续（已包含解密前缀）", float64(resumeOffset)/(1024*1024))
-				} else {
-					// 如果 < 128KB，删除不完整的文件，重新下载
-					utils.Info("📍 [视频下载] 已下载部分 < 128KB，删除不完整文件，重新下载")
-					os.Remove(tmpPath)
-					resumeOffset = 0
-				}
-			} else {
-				// 非加密视频：可以直接续传
-				resumeOffset = existingSize
-				utils.Info("📍 [视频下载] 断点续传，从 %.2f MB 继续", float64(resumeOffset)/(1024*1024))
+	// 进度回调
+	var lastLogTime time.Time
+	onProgress := func(progress float64, downloaded int64, total int64) {
+		// 每秒打印一次日志，避免刷屏
+		now := time.Now()
+		if now.Sub(lastLogTime) >= time.Second {
+			// 转换为MB
+			downloadedMB := float64(downloaded) / (1024 * 1024)
+			totalMB := float64(total) / (1024 * 1024)
+			percentage := progress * 100
+
+			utils.Info("📥 [视频下载] 进度: %.2f%% (%.2f/%.2f MB)", percentage, downloadedMB, totalMB)
+
+			// 发送 WebSocket 事件
+			if h.wsHub != nil {
+				// api_client.js 只识别 type='cmd'
+				h.wsHub.Broadcast(map[string]interface{}{
+					"type": "cmd",
+					"data": map[string]interface{}{
+						"action": "download_progress",
+						"payload": map[string]interface{}{
+							"videoId":    req.VideoID,
+							"percentage": percentage, // 前端 expect "percentage"
+							"downloaded": downloaded,
+							"total":      total,
+							"speed":      0,
+						},
+					},
+				})
 			}
+			lastLogTime = now
 		}
 	}
 
-	// 使用配置的重试次数
-	maxRetries := 3
-	if h.getConfig() != nil && h.getConfig().DownloadRetryCount > 0 {
-		maxRetries = h.getConfig().DownloadRetryCount
-	}
-	if maxRetries < 1 {
-		maxRetries = 3
+	ctx, cancel := context.WithCancel(context.Background())
+	if req.VideoID != "" {
+		h.activeDownloads.Store(req.VideoID, cancel)
 	}
 
-	var lastErr error
-	var written int64
-
-	// 重试下载
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
-			// 递增延迟，给服务器和网络恢复时间
-			delay := time.Second * time.Duration(retry*2)
-			utils.Info("🔄 [视频下载] 等待 %v 后重试 (%d/%d): %s", delay, retry, maxRetries-1, req.Title)
-			time.Sleep(delay)
+	go func(req DownloadVideoRequest, videoPath, tmpPath, downloadsDir string, needDecrypt bool, cancel context.CancelFunc) {
+		defer cancel()
+		if req.VideoID != "" {
+			defer h.activeDownloads.Delete(req.VideoID)
 		}
 
-		// 创建HTTP客户端（每次重试都创建新的客户端和Transport，避免连接污染）
-		transport := &http.Transport{
-			MaxIdleConns:          10,
-			MaxIdleConnsPerHost:   2,
-			IdleConnTimeout:       30 * time.Second,
-			DisableKeepAlives:     false, // 保持连接复用，但每次重试创建新的Transport
-			TLSHandshakeTimeout:   15 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-			ExpectContinueTimeout: 5 * time.Second,
-			DisableCompression:    true, // 禁用压缩，避免问题
+		downloadCtx, downloadCancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer downloadCancel()
+
+		utils.Info("🚀 [视频下载] 使用 Gopeed 引擎: %s", req.Title)
+
+		connections := 8
+		cfg := config.Get()
+		if cfg != nil && cfg.DownloadConnections > 0 {
+			connections = cfg.DownloadConnections
 		}
-		client := &http.Client{
-			Timeout:   30 * time.Minute,
-			Transport: transport,
+		mode := downloadModeFromRequest(req)
+		normalizedURL := normalizeDownloadVideoURL(req)
+		if normalizedURL != req.VideoURL {
+			utils.Info("🩹 [视频下载] 已移除旧版 original 标记并保留签名参数")
+			req.VideoURL = normalizedURL
+		}
+		connections = downloadConnectionCountFromMode(connections, mode)
+		if mode == downloadVideoModeOriginal {
+			utils.Info("🎯 [视频下载] 原始视频使用单连接模式")
 		}
 
-		// 创建请求（每次重试都创建新的context）
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		reqHeaders := map[string]string{
+			"Origin": "https://channels.weixin.qq.com",
+		}
+		if req.SourceURL != "" {
+			reqHeaders["Referer"] = req.SourceURL
+		}
+		if req.UserAgent != "" {
+			reqHeaders["User-Agent"] = req.UserAgent
+		}
+		for k, v := range req.Headers {
+			if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+				continue
+			}
+			reqHeaders[k] = v
+		}
+		utils.Info("🌐 [视频下载] 请求头: Referer=%s | UA=%s | 连接数=%d", reqHeaders["Referer"], reqHeaders["User-Agent"], connections)
 
-		httpReq, err := http.NewRequestWithContext(ctx, "GET", req.VideoURL, nil)
+		_ = os.Remove(tmpPath)
+
+		actualPath, err := h.gopeedService.DownloadSync(downloadCtx, req.VideoURL, tmpPath, connections, reqHeaders, onProgress)
 		if err != nil {
-			lastErr = fmt.Errorf("创建下载请求失败: %v", err)
-			utils.Warn("⚠️ [视频下载] %v", lastErr)
-			continue
-		}
-
-		// 断点续传：设置 Range 头
-		if resumeOffset > 0 {
-			httpReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
-		}
-
-		// 设置请求头
-		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		httpReq.Header.Set("Referer", "https://channels.weixin.qq.com/")
-		httpReq.Header.Set("Accept", "*/*")
-		httpReq.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-		httpReq.Header.Set("Cache-Control", "no-cache")
-
-		// 执行下载
-		downloadReq := struct {
-			VideoURL  string
-			VideoID   string
-			Title     string
-			Author    string
-			Key       string
-			ForceSave bool
-		}{
-			VideoURL:  req.VideoURL,
-			VideoID:   req.VideoID,
-			Title:     req.Title,
-			Author:    req.Author,
-			Key:       req.Key,
-			ForceSave: req.ForceSave,
-		}
-		var expectedTotalSize int64
-		err = h.downloadVideoWithRetry(ctx, client, httpReq, downloadReq, videoPath, needDecrypt, resumeOffset, &written, &expectedTotalSize)
-
-		// 确保 context 取消，释放资源
-		cancel()
-
-		// 关闭 Transport 的连接池，确保连接完全释放
-		transport.CloseIdleConnections()
-
-		if err == nil {
-			// 下载成功，验证文件大小
-			if expectedTotalSize > 0 {
-				stat, statErr := os.Stat(tmpPath)
-				if statErr == nil {
-					actualSize := stat.Size()
-					if actualSize != expectedTotalSize {
-						utils.Warn("⚠️ [视频下载] 文件大小不匹配: 期望 %d bytes (%.2f MB), 实际 %d bytes (%.2f MB)",
-							expectedTotalSize, float64(expectedTotalSize)/(1024*1024),
-							actualSize, float64(actualSize)/(1024*1024))
-						// 如果差异超过1%，认为下载不完整
-						diffPercent := float64(abs(actualSize-expectedTotalSize)) / float64(expectedTotalSize) * 100
-						if diffPercent > 1.0 {
-							os.Remove(tmpPath)
-							err = fmt.Errorf("文件大小不匹配: 期望 %.2f MB, 实际 %.2f MB (差异 %.2f%%)",
-								float64(expectedTotalSize)/(1024*1024),
-								float64(actualSize)/(1024*1024),
-								diffPercent)
-							lastErr = err
-							continue
-						}
-					} else {
-						utils.Info("✓ [视频下载] 文件大小验证通过: %.2f MB", float64(actualSize)/(1024*1024))
-					}
-				}
+			utils.Error("❌ [视频下载] 下载失败: %v", err)
+			if actualPath != "" {
+				_ = os.Remove(actualPath)
 			}
-			// 下载成功
-			break
+			if h.wsHub != nil {
+				h.wsHub.BroadcastCommand("download_failed", map[string]interface{}{
+					"videoId": req.VideoID,
+					"title":   req.Title,
+					"error":   err.Error(),
+				})
+			}
+			return
+		}
+		if actualPath == "" {
+			actualPath = tmpPath
 		}
 
-		lastErr = err
-		utils.Warn("⚠️ [视频下载] 下载失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
+		stat, err := os.Stat(actualPath)
+		if err != nil || stat.Size() == 0 {
+			utils.Error("❌ [视频下载] 下载文件无效")
+			_ = os.Remove(actualPath)
+			if h.wsHub != nil {
+				h.wsHub.BroadcastCommand("download_failed", map[string]interface{}{
+					"videoId": req.VideoID,
+					"title":   req.Title,
+					"error":   "下载文件无效",
+				})
+			}
+			return
+		}
 
-		// 清理临时文件（断点续传模式下保留，除非是最后一次重试）
-		if retry < maxRetries-1 {
-			// 如果服务器不支持 Range，删除临时文件
-			if resumeOffset > 0 && err != nil && strings.Contains(err.Error(), "HTTP 200") {
-				utils.Warn("⚠️ [视频下载] 服务器不支持断点续传，删除临时文件")
-				if removeErr := os.Remove(tmpPath); removeErr != nil && !os.IsNotExist(removeErr) {
-					utils.Warn("⚠️ [视频下载] 清理临时文件失败: %v", removeErr)
+		if err := validateOriginalDownloadSize(mode, req.ExpectedSize, stat.Size()); err != nil {
+			utils.Error("❌ [视频下载] 下载大小校验失败: %v", err)
+			_ = os.Remove(actualPath)
+			if h.wsHub != nil {
+				h.wsHub.BroadcastCommand("download_failed", map[string]interface{}{
+					"videoId": req.VideoID,
+					"title":   req.Title,
+					"error":   err.Error(),
+				})
+			}
+			return
+		}
+
+		if needDecrypt {
+			utils.Info("🔐 [视频下载] 开始解密...")
+			if err := utils.DecryptFileInPlace(actualPath, req.Key, "", 0); err != nil {
+				utils.Error("❌ [视频下载] 解密失败: %v", err)
+				_ = os.Remove(actualPath)
+				if h.wsHub != nil {
+					h.wsHub.BroadcastCommand("download_failed", map[string]interface{}{
+						"videoId": req.VideoID,
+						"title":   req.Title,
+						"error":   fmt.Sprintf("解密失败: %v", err),
+					})
 				}
-				resumeOffset = 0 // 下次重试从头开始
-			} else if !resumeEnabled || needDecrypt {
-				// 非断点续传模式或加密视频（如果文件不完整），删除临时文件
-				if removeErr := os.Remove(tmpPath); removeErr != nil && !os.IsNotExist(removeErr) {
-					utils.Warn("⚠️ [视频下载] 清理临时文件失败: %v", removeErr)
-				}
+				return
+			}
+			utils.Info("✓ [视频下载] 解密完成")
+		}
+
+		finalPath, err := utils.MoveFileToAvailablePathWithSuffix(actualPath, videoPath, requiredSuffix)
+		if err != nil {
+			_ = os.Remove(actualPath)
+			utils.Error("❌ [视频下载] 重命名文件失败: %v", err)
+			if h.wsHub != nil {
+				h.wsHub.BroadcastCommand("download_failed", map[string]interface{}{
+					"videoId": req.VideoID,
+					"title":   req.Title,
+					"error":   fmt.Sprintf("重命名文件失败: %v", err),
+				})
+			}
+			return
+		}
+		if finalPath != videoPath {
+			utils.Warn("📁 [视频下载] 目标文件已存在，已自动保存为: %s", filepath.Base(finalPath))
+		}
+
+		fileSize := float64(stat.Size()) / (1024 * 1024)
+		relativePath, _ := filepath.Rel(downloadsDir, finalPath)
+
+		statusMsg := ""
+		if needDecrypt {
+			statusMsg = " [已解密]"
+		}
+		utils.Info("✓ [视频下载] 视频已保存%s", statusMsg)
+
+		if h.downloadService != nil {
+			record := &database.DownloadRecord{
+				ID:           req.VideoID,
+				VideoID:      req.VideoID,
+				Title:        req.Title,
+				Author:       req.Author,
+				Duration:     0,
+				FileSize:     int64(stat.Size()),
+				FilePath:     finalPath,
+				Format:       "mp4",
+				Resolution:   req.Resolution,
+				Status:       database.DownloadStatusCompleted,
+				DownloadTime: time.Now(),
+				LikeCount:    req.LikeCount,
+				CommentCount: req.CommentCount,
+				ForwardCount: req.ForwardCount,
+				FavCount:     req.FavCount,
+			}
+			if err := h.downloadService.Create(record); err != nil {
+				utils.Error("保存下载记录失败: %v", err)
+			} else {
+				utils.Info("已保存下载记录: %s", record.Title)
 			}
 		}
 
-		// 给系统一些时间释放资源
-		if retry < maxRetries-1 {
-			time.Sleep(500 * time.Millisecond)
+		if h.wsHub != nil {
+			h.wsHub.BroadcastCommand("download_complete", map[string]interface{}{
+				"videoId":      req.VideoID,
+				"title":        req.Title,
+				"path":         finalPath,
+				"relativePath": relativePath,
+				"size":         fileSize,
+				"decrypted":    needDecrypt,
+			})
 		}
-	}
+	}(req, videoPath, tmpPath, downloadsDir, needDecrypt, cancel)
 
-	// 检查是否下载成功
-	if lastErr != nil {
-		utils.Error("❌ [视频下载] 下载失败（已重试 %d 次）: %v", maxRetries, lastErr)
-		h.sendErrorResponse(Conn, fmt.Errorf("下载失败（已重试 %d 次）: %v", maxRetries, lastErr))
-		return true
-	}
-
-	// 验证文件并重命名
-	stat, err := os.Stat(tmpPath)
-	if err != nil {
-		utils.Error("❌ [视频下载] 临时文件不存在: %v", err)
-		h.sendErrorResponse(Conn, fmt.Errorf("临时文件不存在: %v", err))
-		return true
-	}
-
-	if stat.Size() == 0 {
-		os.Remove(tmpPath)
-		utils.Error("❌ [视频下载] 下载的文件为空")
-		h.sendErrorResponse(Conn, fmt.Errorf("下载的文件为空"))
-		return true
-	}
-
-	// 重命名为最终文件
-	if err := os.Rename(tmpPath, videoPath); err != nil {
-		os.Remove(tmpPath)
-		utils.Error("❌ [视频下载] 重命名文件失败: %v", err)
-		h.sendErrorResponse(Conn, fmt.Errorf("重命名文件失败: %v", err))
-		return true
-	}
-
-	fileSize := float64(stat.Size()) / (1024 * 1024)
-	relativePath, _ := filepath.Rel(downloadsDir, videoPath)
-
-	statusMsg := ""
-	if needDecrypt {
-		statusMsg = " [已解密]"
-	}
-	utils.Info("✓ [视频下载] 视频已保存: %s (%.2f MB)%s", relativePath, fileSize, statusMsg)
-
-	// 注意：不再手动保存下载记录，因为队列系统已经处理了记录保存
-	// 移除重复的记录调用以避免数据库中出现重复记录
-
-	responseData := map[string]interface{}{
-		"success":      true,
-		"path":         videoPath,
-		"relativePath": relativePath,
-		"size":         fileSize,
-		"decrypted":    needDecrypt,
-	}
-	responseBytes, err := json.Marshal(responseData)
-	if err != nil {
-		utils.HandleError(err, "生成响应JSON")
-		h.sendErrorResponse(Conn, err)
-		return true
-	}
-	h.sendJSONResponse(Conn, 200, responseBytes)
+	h.sendJSONResponse(Conn, 200, map[string]interface{}{
+		"success": true,
+		"started": true,
+		"message": "下载任务已在后台启动",
+	})
 	return true
 }
 
@@ -1274,14 +1602,7 @@ func abs(x int64) int64 {
 }
 
 // downloadVideoWithRetry 执行一次视频下载尝试（支持重试和断点续传）
-func (h *UploadHandler) downloadVideoWithRetry(ctx context.Context, client *http.Client, httpReq *http.Request, req struct {
-	VideoURL  string
-	VideoID   string
-	Title     string
-	Author    string
-	Key       string
-	ForceSave bool
-}, videoPath string, needDecrypt bool, resumeOffset int64, written *int64, expectedTotalSize *int64) error {
+func (h *UploadHandler) downloadVideoWithRetry(ctx context.Context, client *http.Client, httpReq *http.Request, req DownloadVideoRequest, videoPath string, needDecrypt bool, resumeOffset int64, written *int64, expectedTotalSize *int64) error {
 	tmpPath := videoPath + ".tmp"
 	prefixLen := int64(131072) // 128KB 加密前缀长度
 
@@ -1303,6 +1624,41 @@ func (h *UploadHandler) downloadVideoWithRetry(ctx context.Context, client *http
 			resp.Body.Close()
 		}
 	}()
+
+	// 包装 resp.Body 以显示进度
+	if req.Title != "" { // 只对有标题的请求（真实下载）显示进度
+		resp.Body = &utils.ProgressReader{
+			Ctx:    ctx, // 传递上下文以支持取消
+			Reader: resp.Body,
+			Total:  resp.ContentLength,
+			OnProgress: func(current, total int64) {
+				if total > 0 {
+					percent := float64(current) / float64(total) * 100
+					// 使用 \r 在同一行刷新? 不，标准日志会换行。
+					// 这里的日志系统是 utils.Info，通常会换行。
+					// 为了避免刷屏，我们在 ProgressReader 中已经限制了1秒一次。
+					// 但如果是日志文件，\r 没用。
+					// 可以在这里再次控制频率或格式。
+					utils.Info("📥 [视频下载] 进度: %.2f%% (%.2f/%.2f MB)",
+						percent, float64(current)/(1024*1024), float64(total)/(1024*1024))
+
+					// 广播进度到 WebSocket
+					if h.wsHub != nil {
+						h.wsHub.BroadcastCommand("download_progress", map[string]interface{}{
+							"videoUrl":   req.VideoURL,
+							"videoId":    req.VideoID,
+							"title":      req.Title,
+							"current":    current,
+							"total":      total,
+							"percentage": percent,
+						})
+					}
+				} else {
+					utils.Info("📥 [视频下载] 已下载: %.2f MB", float64(current)/(1024*1024))
+				}
+			},
+		}
+	}
 
 	// 检查响应状态（支持 200 和 206 Partial Content）
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
@@ -1366,7 +1722,7 @@ func (h *UploadHandler) downloadVideoWithRetry(ctx context.Context, client *http
 			utils.Info("🔐 [视频下载] 开始解密下载...")
 
 			// 解析 key 为 uint64
-			seed, err := parseKey(req.Key)
+			seed, err := utils.ParseKey(req.Key)
 			if err != nil {
 				return fmt.Errorf("解析密钥失败: %v", err)
 			}
@@ -1560,8 +1916,7 @@ func (h *UploadHandler) HandleUploadStatus(Conn *SunnyNet.HttpConn) bool {
 	}
 
 	resp := map[string]interface{}{"success": true, "parts": parts}
-	b, _ := json.Marshal(resp)
-	h.sendJSONResponse(Conn, 200, b)
+	h.sendJSONResponse(Conn, 200, resp)
 	return true
 }
 
@@ -1587,11 +1942,16 @@ func (h *UploadHandler) sendSuccessResponse(Conn *SunnyNet.HttpConn) {
 			}
 		}
 	}
-	Conn.StopRequest(200, `{"success":true}`, headers)
+	Conn.StopRequest(200, string(response.SuccessJSON(nil)), headers)
 }
 
+// sendJSONResponse 发送JSON响应 (Assuming body is the Data part of standard response, or needs to be wrapped)
+// CAUTION: The existing callsites pass a full object like {"success": true, "uploadId": ...}.
+// We need to change the semantic. 'body' passed here should be treated as the 'Data' field content if we want consistent structure.
+// However, the existing callsites manually construct {"success": true...}. We should refactor callsites first?
+// Let's refactor sendJSONResponse to accept interface{} instead of []byte and encoding it.
 // sendJSONResponse 发送JSON响应
-func (h *UploadHandler) sendJSONResponse(Conn *SunnyNet.HttpConn, statusCode int, body []byte) {
+func (h *UploadHandler) sendJSONResponse(Conn *SunnyNet.HttpConn, statusCode int, data interface{}) {
 	headers := http.Header{}
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -1612,7 +1972,22 @@ func (h *UploadHandler) sendJSONResponse(Conn *SunnyNet.HttpConn, statusCode int
 			}
 		}
 	}
-	Conn.StopRequest(statusCode, string(body), headers)
+
+	var respBytes []byte
+	if b, ok := data.([]byte); ok {
+		respBytes = b
+	} else {
+		var err error
+		respBytes, err = json.Marshal(data)
+		if err != nil {
+			utils.Error("JSON marshaling failed: %v", err)
+			// Fallback error
+			Conn.StopRequest(500, `{"success":false,"error":"internal_error"}`, headers)
+			return
+		}
+	}
+
+	Conn.StopRequest(statusCode, string(respBytes), headers)
 }
 
 // sendErrorResponse 发送错误响应
@@ -1634,8 +2009,7 @@ func (h *UploadHandler) sendErrorResponse(Conn *SunnyNet.HttpConn, err error) {
 			}
 		}
 	}
-	errorMsg := fmt.Sprintf(`{"success":false,"error":"%s"}`, err.Error())
-	Conn.StopRequest(500, errorMsg, headers)
+	Conn.StopRequest(500, string(response.ErrorJSON(500, err.Error())), headers)
 }
 
 // 注意：saveDownloadRecord 方法已被移除
@@ -1643,4 +2017,3 @@ func (h *UploadHandler) sendErrorResponse(Conn *SunnyNet.HttpConn, err error) {
 // 而队列系统的 CompleteDownload() 方法使用格式化的文件名（？ 替换为 _），
 // 导致出现重复记录且文件名格式不一致。
 // 现在统一使用队列系统的 CompleteDownload() 方法来创建下载记录。
-

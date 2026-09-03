@@ -7,28 +7,38 @@ import (
 	"time"
 )
 
-// SettingsRepository handles settings database operations
+// SettingsRepository 处理设置数据库操作
 type SettingsRepository struct {
 	db *sql.DB
 }
 
-// NewSettingsRepository creates a new SettingsRepository
+// NewSettingsRepository 创建一个新的 SettingsRepository
 func NewSettingsRepository() *SettingsRepository {
 	return &SettingsRepository{db: GetDB()}
 }
 
-// Setting keys
+// GetDBUnsafe 返回底层 DB 指针，用于调用方在无数据库上下文时安全降级。
+func (r *SettingsRepository) GetDBUnsafe() *sql.DB {
+	if r == nil {
+		return nil
+	}
+	return r.db
+}
+
+// 设置键
 const (
-	SettingKeyDownloadDir        = "download_dir"
-	SettingKeyChunkSize          = "chunk_size"
-	SettingKeyConcurrentLimit    = "concurrent_limit"
-	SettingKeyAutoCleanupEnabled = "auto_cleanup_enabled"
-	SettingKeyAutoCleanupDays    = "auto_cleanup_days"
-	SettingKeyMaxRetries         = "max_retries"
-	SettingKeyTheme              = "theme"
+	SettingKeyDownloadDir                 = "download_dir"
+	SettingKeyDownloadFilenameWithVideoID = "download_filename_with_video_id"
+	SettingKeyChunkSize                   = "chunk_size"
+	SettingKeyConcurrentLimit             = "concurrent_limit"
+	SettingKeyAutoCleanupEnabled          = "auto_cleanup_enabled"
+	SettingKeyAutoCleanupDays             = "auto_cleanup_days"
+	SettingKeyMaxRetries                  = "max_retries"
+	SettingKeyRadarEnabled                = "radar_enabled"
+	SettingKeyTheme                       = "theme"
 )
 
-// Get retrieves a setting value by key
+// Get 根据键获取设置值
 func (r *SettingsRepository) Get(key string) (string, error) {
 	var value string
 	err := r.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
@@ -41,7 +51,7 @@ func (r *SettingsRepository) Get(key string) (string, error) {
 	return value, nil
 }
 
-// Set saves a setting value
+// Set 保存设置值
 func (r *SettingsRepository) Set(key, value string) error {
 	query := `
 		INSERT INTO settings (key, value, updated_at)
@@ -56,7 +66,7 @@ func (r *SettingsRepository) Set(key, value string) error {
 	return nil
 }
 
-// Delete removes a setting by key
+// Delete 根据键删除设置
 func (r *SettingsRepository) Delete(key string) error {
 	_, err := r.db.Exec("DELETE FROM settings WHERE key = ?", key)
 	if err != nil {
@@ -65,7 +75,7 @@ func (r *SettingsRepository) Delete(key string) error {
 	return nil
 }
 
-// GetAll retrieves all settings as a map
+// GetAll 获取所有设置（作为映射）
 func (r *SettingsRepository) GetAll() (map[string]string, error) {
 	rows, err := r.db.Query("SELECT key, value FROM settings")
 	if err != nil {
@@ -85,7 +95,7 @@ func (r *SettingsRepository) GetAll() (map[string]string, error) {
 	return settings, nil
 }
 
-// Load retrieves all settings as a Settings struct
+// Load 获取所有设置（作为 Settings 结构体）
 func (r *SettingsRepository) Load() (*Settings, error) {
 	settingsMap, err := r.GetAll()
 	if err != nil {
@@ -96,6 +106,9 @@ func (r *SettingsRepository) Load() (*Settings, error) {
 
 	if v, ok := settingsMap[SettingKeyDownloadDir]; ok && v != "" {
 		settings.DownloadDir = v
+	}
+	if v, ok := settingsMap[SettingKeyDownloadFilenameWithVideoID]; ok {
+		settings.DownloadFilenameWithVideoID = v == "true"
 	}
 	if v, ok := settingsMap[SettingKeyChunkSize]; ok && v != "" {
 		if size, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -127,7 +140,7 @@ func (r *SettingsRepository) Load() (*Settings, error) {
 	return settings, nil
 }
 
-// Save persists a Settings struct to the database
+// Save 将 Settings 结构体保存到数据库
 func (r *SettingsRepository) Save(settings *Settings) error {
 	tx, err := r.db.Begin()
 	if err != nil {
@@ -144,13 +157,14 @@ func (r *SettingsRepository) Save(settings *Settings) error {
 
 	// Save each setting
 	settingsMap := map[string]string{
-		SettingKeyDownloadDir:        settings.DownloadDir,
-		SettingKeyChunkSize:          strconv.FormatInt(settings.ChunkSize, 10),
-		SettingKeyConcurrentLimit:    strconv.Itoa(settings.ConcurrentLimit),
-		SettingKeyAutoCleanupEnabled: strconv.FormatBool(settings.AutoCleanupEnabled),
-		SettingKeyAutoCleanupDays:    strconv.Itoa(settings.AutoCleanupDays),
-		SettingKeyMaxRetries:         strconv.Itoa(settings.MaxRetries),
-		SettingKeyTheme:              settings.Theme,
+		SettingKeyDownloadDir:                 settings.DownloadDir,
+		SettingKeyDownloadFilenameWithVideoID: strconv.FormatBool(settings.DownloadFilenameWithVideoID),
+		SettingKeyChunkSize:                   strconv.FormatInt(settings.ChunkSize, 10),
+		SettingKeyConcurrentLimit:             strconv.Itoa(settings.ConcurrentLimit),
+		SettingKeyAutoCleanupEnabled:          strconv.FormatBool(settings.AutoCleanupEnabled),
+		SettingKeyAutoCleanupDays:             strconv.Itoa(settings.AutoCleanupDays),
+		SettingKeyMaxRetries:                  strconv.Itoa(settings.MaxRetries),
+		SettingKeyTheme:                       settings.Theme,
 	}
 
 	for key, value := range settingsMap {
@@ -160,6 +174,10 @@ func (r *SettingsRepository) Save(settings *Settings) error {
 		}
 	}
 
+	if _, err := tx.Exec("DELETE FROM settings WHERE key = ?", SettingKeyRadarEnabled); err != nil {
+		return fmt.Errorf("failed to delete deprecated setting %s: %w", SettingKeyRadarEnabled, err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -167,7 +185,7 @@ func (r *SettingsRepository) Save(settings *Settings) error {
 	return nil
 }
 
-// Validate validates settings values
+// Validate 验证设置值
 func (r *SettingsRepository) Validate(settings *Settings) error {
 	// Validate chunk size (1MB to 100MB)
 	minChunkSize := int64(1 * 1024 * 1024)   // 1MB
@@ -200,7 +218,7 @@ func (r *SettingsRepository) Validate(settings *Settings) error {
 	return nil
 }
 
-// SaveAndValidate validates and saves settings
+// SaveAndValidate 验证并保存设置
 func (r *SettingsRepository) SaveAndValidate(settings *Settings) error {
 	if err := r.Validate(settings); err != nil {
 		return err
@@ -208,7 +226,7 @@ func (r *SettingsRepository) SaveAndValidate(settings *Settings) error {
 	return r.Save(settings)
 }
 
-// GetInt retrieves an integer setting value
+// GetInt 获取整数设置值
 func (r *SettingsRepository) GetInt(key string, defaultValue int) (int, error) {
 	value, err := r.Get(key)
 	if err != nil {
@@ -224,7 +242,7 @@ func (r *SettingsRepository) GetInt(key string, defaultValue int) (int, error) {
 	return intValue, nil
 }
 
-// GetInt64 retrieves an int64 setting value
+// GetInt64 获取 int64 设置值
 func (r *SettingsRepository) GetInt64(key string, defaultValue int64) (int64, error) {
 	value, err := r.Get(key)
 	if err != nil {
@@ -240,7 +258,7 @@ func (r *SettingsRepository) GetInt64(key string, defaultValue int64) (int64, er
 	return int64Value, nil
 }
 
-// GetBool retrieves a boolean setting value
+// GetBool 获取布尔设置值
 func (r *SettingsRepository) GetBool(key string, defaultValue bool) (bool, error) {
 	value, err := r.Get(key)
 	if err != nil {
@@ -252,17 +270,17 @@ func (r *SettingsRepository) GetBool(key string, defaultValue bool) (bool, error
 	return value == "true", nil
 }
 
-// SetInt saves an integer setting value
+// SetInt 保存整数设置值
 func (r *SettingsRepository) SetInt(key string, value int) error {
 	return r.Set(key, strconv.Itoa(value))
 }
 
-// SetInt64 saves an int64 setting value
+// SetInt64 保存 int64 设置值
 func (r *SettingsRepository) SetInt64(key string, value int64) error {
 	return r.Set(key, strconv.FormatInt(value, 10))
 }
 
-// SetBool saves a boolean setting value
+// SetBool 保存布尔设置值
 func (r *SettingsRepository) SetBool(key string, value bool) error {
 	return r.Set(key, strconv.FormatBool(value))
 }

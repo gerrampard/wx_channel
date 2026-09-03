@@ -7,34 +7,37 @@ import (
 	"time"
 )
 
-// DownloadRecordRepository handles download record database operations
+// DownloadRecordRepository 处理下载记录数据库操作
 type DownloadRecordRepository struct {
 	db *sql.DB
 }
 
-// NewDownloadRecordRepository creates a new DownloadRecordRepository
+// NewDownloadRecordRepository 创建一个新的 DownloadRecordRepository
 func NewDownloadRecordRepository() *DownloadRecordRepository {
 	return &DownloadRecordRepository{db: GetDB()}
 }
 
-// Create inserts a new download record
+// Create 插入新的下载记录
 func (r *DownloadRecordRepository) Create(record *DownloadRecord) error {
 	now := time.Now()
 	record.CreatedAt = now
 	record.UpdatedAt = now
 
 	query := `
-		INSERT INTO download_records (
+		INSERT OR REPLACE INTO download_records (
 			id, video_id, title, author, cover_url, duration, file_size, file_path,
 			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := r.db.Exec(query,
 		record.ID, record.VideoID, record.Title, record.Author, record.CoverURL,
 		record.Duration, record.FileSize, record.FilePath, record.Format,
 		record.Resolution, record.Status, record.DownloadTime,
-		record.ErrorMessage, record.CreatedAt, record.UpdatedAt,
+		record.ErrorMessage,
+		record.LikeCount, record.CommentCount, record.ForwardCount, record.FavCount,
+		record.CreatedAt, record.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create download record: %w", err)
@@ -42,11 +45,12 @@ func (r *DownloadRecordRepository) Create(record *DownloadRecord) error {
 	return nil
 }
 
-// GetByID retrieves a download record by ID
+// GetByID 根据 ID 获取下载记录
 func (r *DownloadRecordRepository) GetByID(id string) (*DownloadRecord, error) {
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
 			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
 			created_at, updated_at
 		FROM download_records WHERE id = ?
 	`
@@ -56,7 +60,9 @@ func (r *DownloadRecordRepository) GetByID(id string) (*DownloadRecord, error) {
 		&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
 		&record.Duration, &record.FileSize, &filePath, &format,
 		&resolution, &record.Status, &record.DownloadTime,
-		&errorMessage, &record.CreatedAt, &record.UpdatedAt,
+		&errorMessage,
+		&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+		&record.CreatedAt, &record.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -72,7 +78,40 @@ func (r *DownloadRecordRepository) GetByID(id string) (*DownloadRecord, error) {
 	return record, nil
 }
 
-// Update updates an existing download record
+// GetByVideoID 根据 VideoID 获取下载记录
+func (r *DownloadRecordRepository) GetByVideoID(videoID string) (*DownloadRecord, error) {
+	query := `
+		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
+			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
+			created_at, updated_at
+		FROM download_records WHERE video_id = ? LIMIT 1
+	`
+	record := &DownloadRecord{}
+	var filePath, format, resolution, errorMessage, coverURL sql.NullString
+	err := r.db.QueryRow(query, videoID).Scan(
+		&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
+		&record.Duration, &record.FileSize, &filePath, &format,
+		&resolution, &record.Status, &record.DownloadTime,
+		&errorMessage,
+		&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+		&record.CreatedAt, &record.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get download record by video id: %w", err)
+	}
+	record.CoverURL = coverURL.String
+	record.FilePath = filePath.String
+	record.Format = format.String
+	record.Resolution = resolution.String
+	record.ErrorMessage = errorMessage.String
+	return record, nil
+}
+
+// Update 更新现有的下载记录
 func (r *DownloadRecordRepository) Update(record *DownloadRecord) error {
 	record.UpdatedAt = time.Now()
 
@@ -99,7 +138,7 @@ func (r *DownloadRecordRepository) Update(record *DownloadRecord) error {
 	return nil
 }
 
-// Delete removes a download record by ID
+// Delete 根据 ID 删除下载记录
 func (r *DownloadRecordRepository) Delete(id string) error {
 	query := "DELETE FROM download_records WHERE id = ?"
 	result, err := r.db.Exec(query, id)
@@ -113,7 +152,7 @@ func (r *DownloadRecordRepository) Delete(id string) error {
 	return nil
 }
 
-// DeleteMany removes multiple download records by IDs
+// DeleteMany 根据 ID 删除多条下载记录
 func (r *DownloadRecordRepository) DeleteMany(ids []string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
@@ -134,7 +173,7 @@ func (r *DownloadRecordRepository) DeleteMany(ids []string) (int64, error) {
 	return result.RowsAffected()
 }
 
-// Clear removes all download records
+// Clear 删除所有下载记录
 func (r *DownloadRecordRepository) Clear() error {
 	_, err := r.db.Exec("DELETE FROM download_records")
 	if err != nil {
@@ -143,7 +182,7 @@ func (r *DownloadRecordRepository) Clear() error {
 	return nil
 }
 
-// List retrieves download records with pagination, filtering, and sorting
+// List 获取分页、过滤和排序的下载记录
 func (r *DownloadRecordRepository) List(params *FilterParams) (*PagedResult[DownloadRecord], error) {
 	// Set defaults
 	if params.Page < 1 {
@@ -213,6 +252,7 @@ func (r *DownloadRecordRepository) List(params *FilterParams) (*PagedResult[Down
 	query := fmt.Sprintf(`
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
 			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
 			created_at, updated_at
 		FROM download_records
 		%s
@@ -235,7 +275,9 @@ func (r *DownloadRecordRepository) List(params *FilterParams) (*PagedResult[Down
 			&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
 			&record.Duration, &record.FileSize, &filePath, &format,
 			&resolution, &record.Status, &record.DownloadTime,
-			&errorMessage, &record.CreatedAt, &record.UpdatedAt,
+			&errorMessage,
+			&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+			&record.CreatedAt, &record.UpdatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan download record: %w", err)
@@ -255,7 +297,7 @@ func (r *DownloadRecordRepository) List(params *FilterParams) (*PagedResult[Down
 	return NewPagedResult(records, total, params.Page, params.PageSize), nil
 }
 
-// Count returns the total number of download records
+// Count 返回下载记录的总数
 func (r *DownloadRecordRepository) Count() (int64, error) {
 	var count int64
 	err := r.db.QueryRow("SELECT COUNT(*) FROM download_records").Scan(&count)
@@ -265,7 +307,7 @@ func (r *DownloadRecordRepository) Count() (int64, error) {
 	return count, nil
 }
 
-// CountByStatus returns the count of records with a specific status
+// CountByStatus 返回指定状态的记录数
 func (r *DownloadRecordRepository) CountByStatus(status string) (int64, error) {
 	var count int64
 	err := r.db.QueryRow("SELECT COUNT(*) FROM download_records WHERE status = ?", status).Scan(&count)
@@ -275,21 +317,26 @@ func (r *DownloadRecordRepository) CountByStatus(status string) (int64, error) {
 	return count, nil
 }
 
-// CountToday returns the count of records downloaded today
+// CountToday 返回今天下载的记录数
 func (r *DownloadRecordRepository) CountToday() (int64, error) {
-	var count int64
 	today := time.Now().Format("2006-01-02")
-	err := r.db.QueryRow(
-		"SELECT COUNT(*) FROM download_records WHERE date(download_time) = ?",
-		today,
-	).Scan(&count)
+	count, err := r.countByLocalDate(today)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count today's download records: %w", err)
 	}
 	return count, nil
 }
 
-// GetRecent retrieves the most recent download records
+func (r *DownloadRecordRepository) countByLocalDate(date string) (int64, error) {
+	var count int64
+	err := r.db.QueryRow(
+		"SELECT COUNT(*) FROM download_records WHERE substr(download_time, 1, 10) = ?",
+		date,
+	).Scan(&count)
+	return count, err
+}
+
+// GetRecent 获取最近的下载记录
 func (r *DownloadRecordRepository) GetRecent(limit int) ([]DownloadRecord, error) {
 	if limit < 1 {
 		limit = 5
@@ -298,6 +345,7 @@ func (r *DownloadRecordRepository) GetRecent(limit int) ([]DownloadRecord, error
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
 			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
 			created_at, updated_at
 		FROM download_records
 		ORDER BY download_time DESC
@@ -318,7 +366,9 @@ func (r *DownloadRecordRepository) GetRecent(limit int) ([]DownloadRecord, error
 			&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
 			&record.Duration, &record.FileSize, &filePath, &format,
 			&resolution, &record.Status, &record.DownloadTime,
-			&errorMessage, &record.CreatedAt, &record.UpdatedAt,
+			&errorMessage,
+			&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+			&record.CreatedAt, &record.UpdatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan download record: %w", err)
@@ -338,7 +388,7 @@ func (r *DownloadRecordRepository) GetRecent(limit int) ([]DownloadRecord, error
 	return records, nil
 }
 
-// DeleteBefore deletes all records before the specified date
+// DeleteBefore 删除指定日期前的所有记录
 func (r *DownloadRecordRepository) DeleteBefore(date time.Time) (int64, error) {
 	result, err := r.db.Exec("DELETE FROM download_records WHERE download_time < ?", date)
 	if err != nil {
@@ -347,11 +397,12 @@ func (r *DownloadRecordRepository) DeleteBefore(date time.Time) (int64, error) {
 	return result.RowsAffected()
 }
 
-// GetAll retrieves all download records (for export)
+// GetAll 获取所有下载记录（用于导出）
 func (r *DownloadRecordRepository) GetAll() ([]DownloadRecord, error) {
 	query := `
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
 			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
 			created_at, updated_at
 		FROM download_records
 		ORDER BY download_time DESC
@@ -371,7 +422,9 @@ func (r *DownloadRecordRepository) GetAll() ([]DownloadRecord, error) {
 			&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
 			&record.Duration, &record.FileSize, &filePath, &format,
 			&resolution, &record.Status, &record.DownloadTime,
-			&errorMessage, &record.CreatedAt, &record.UpdatedAt,
+			&errorMessage,
+			&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+			&record.CreatedAt, &record.UpdatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan download record: %w", err)
@@ -391,7 +444,7 @@ func (r *DownloadRecordRepository) GetAll() ([]DownloadRecord, error) {
 	return records, nil
 }
 
-// GetByIDs retrieves download records by IDs
+// GetByIDs 根据 ID 获取下载记录
 func (r *DownloadRecordRepository) GetByIDs(ids []string) ([]DownloadRecord, error) {
 	if len(ids) == 0 {
 		return []DownloadRecord{}, nil
@@ -407,6 +460,7 @@ func (r *DownloadRecordRepository) GetByIDs(ids []string) ([]DownloadRecord, err
 	query := fmt.Sprintf(`
 		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
 			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
 			created_at, updated_at
 		FROM download_records
 		WHERE id IN (%s)
@@ -427,7 +481,9 @@ func (r *DownloadRecordRepository) GetByIDs(ids []string) ([]DownloadRecord, err
 			&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
 			&record.Duration, &record.FileSize, &filePath, &format,
 			&resolution, &record.Status, &record.DownloadTime,
-			&errorMessage, &record.CreatedAt, &record.UpdatedAt,
+			&errorMessage,
+			&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+			&record.CreatedAt, &record.UpdatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan download record: %w", err)
@@ -447,7 +503,7 @@ func (r *DownloadRecordRepository) GetByIDs(ids []string) ([]DownloadRecord, err
 	return records, nil
 }
 
-// GetChartData returns download counts for the last N days
+// GetChartData 返回过去 N 天的下载统计
 func (r *DownloadRecordRepository) GetChartData(days int) ([]string, []int64, error) {
 	if days < 1 {
 		days = 7
@@ -461,11 +517,7 @@ func (r *DownloadRecordRepository) GetChartData(days int) ([]string, []int64, er
 		dateStr := date.Format("2006-01-02")
 		labels[days-1-i] = dateStr
 
-		var count int64
-		err := r.db.QueryRow(
-			"SELECT COUNT(*) FROM download_records WHERE date(download_time) = ?",
-			dateStr,
-		).Scan(&count)
+		count, err := r.countByLocalDate(dateStr)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get chart data: %w", err)
 		}
@@ -475,7 +527,7 @@ func (r *DownloadRecordRepository) GetChartData(days int) ([]string, []int64, er
 	return labels, values, nil
 }
 
-// GetTotalFileSize returns the total file size of all completed downloads
+// GetTotalFileSize 返回所有已完成下载的总文件大小
 func (r *DownloadRecordRepository) GetTotalFileSize() (int64, error) {
 	var total sql.NullInt64
 	err := r.db.QueryRow(
@@ -486,4 +538,70 @@ func (r *DownloadRecordRepository) GetTotalFileSize() (int64, error) {
 		return 0, fmt.Errorf("failed to get total file size: %w", err)
 	}
 	return total.Int64, nil
+}
+
+// GetRecordsSince 获取指定时间之后的下载记录（用于增量同步）
+func (r *DownloadRecordRepository) GetRecordsSince(since time.Time, limit int) ([]DownloadRecord, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	query := `
+		SELECT id, video_id, title, author, COALESCE(cover_url, '') as cover_url, duration, file_size, file_path,
+			format, resolution, status, download_time, error_message,
+			like_count, comment_count, forward_count, fav_count,
+			created_at, updated_at
+		FROM download_records
+		WHERE updated_at > ?
+		ORDER BY updated_at ASC
+		LIMIT ?
+	`
+
+	rows, err := r.db.Query(query, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get records since: %w", err)
+	}
+	defer rows.Close()
+
+	var records []DownloadRecord
+	for rows.Next() {
+		var record DownloadRecord
+		var filePath, format, resolution, errorMessage, coverURL sql.NullString
+		err := rows.Scan(
+			&record.ID, &record.VideoID, &record.Title, &record.Author, &coverURL,
+			&record.Duration, &record.FileSize, &filePath, &format,
+			&resolution, &record.Status, &record.DownloadTime,
+			&errorMessage,
+			&record.LikeCount, &record.CommentCount, &record.ForwardCount, &record.FavCount,
+			&record.CreatedAt, &record.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan download record: %w", err)
+		}
+		record.CoverURL = coverURL.String
+		record.FilePath = filePath.String
+		record.Format = format.String
+		record.Resolution = resolution.String
+		record.ErrorMessage = errorMessage.String
+		records = append(records, record)
+	}
+
+	if records == nil {
+		records = []DownloadRecord{}
+	}
+
+	return records, nil
+}
+
+// GetLatestTimestamp 获取最新记录的时间戳（用于增量同步）
+func (r *DownloadRecordRepository) GetLatestTimestamp() (time.Time, error) {
+	var timestamp time.Time
+	err := r.db.QueryRow("SELECT COALESCE(MAX(updated_at), '1970-01-01') FROM download_records").Scan(&timestamp)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get latest timestamp: %w", err)
+	}
+	return timestamp, nil
 }

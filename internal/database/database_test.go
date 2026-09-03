@@ -4,31 +4,30 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 )
 
 func setupTestDB(t *testing.T) func() {
-	// Create temp directory for test database
+	// 创建测试数据库的临时目录
 	tmpDir, err := os.MkdirTemp("", "wx_channel_test_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
 	dbPath := filepath.Join(tmpDir, "test.db")
-	
-	// Directly open database for testing (bypass once)
+
+	// 直接打开数据库进行测试（绕过 once）
 	testDB, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on&_journal_mode=WAL")
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	// Set the global db
+	// 设置全局数据库
 	db = testDB
 
-	// Run migrations
+	// 运行迁移
 	if err := runMigrations(); err != nil {
 		testDB.Close()
 		os.RemoveAll(tmpDir)
@@ -41,8 +40,8 @@ func setupTestDB(t *testing.T) func() {
 			db = nil
 		}
 		os.RemoveAll(tmpDir)
-		// Reset once for next initialization
-		once = sync.Once{}
+		// 重置初始化状态以便下次初始化
+		initialized = false
 	}
 }
 
@@ -52,7 +51,7 @@ func TestBrowseHistoryRepository(t *testing.T) {
 
 	repo := NewBrowseHistoryRepository()
 
-	// Test Create
+	// 测试创建
 	record := &BrowseRecord{
 		ID:           "test-video-1",
 		Title:        "Test Video",
@@ -75,7 +74,7 @@ func TestBrowseHistoryRepository(t *testing.T) {
 		t.Fatalf("Failed to create browse record: %v", err)
 	}
 
-	// Test GetByID
+	// 测试根据 ID 获取
 	retrieved, err := repo.GetByID("test-video-1")
 	if err != nil {
 		t.Fatalf("Failed to get browse record: %v", err)
@@ -87,7 +86,7 @@ func TestBrowseHistoryRepository(t *testing.T) {
 		t.Errorf("Expected title 'Test Video', got '%s'", retrieved.Title)
 	}
 
-	// Test Update
+	// 测试更新
 	record.Title = "Updated Title"
 	err = repo.Update(record)
 	if err != nil {
@@ -99,7 +98,7 @@ func TestBrowseHistoryRepository(t *testing.T) {
 		t.Errorf("Expected title 'Updated Title', got '%s'", retrieved.Title)
 	}
 
-	// Test List
+	// 测试列表
 	result, err := repo.List(&PaginationParams{Page: 1, PageSize: 10, SortDesc: true})
 	if err != nil {
 		t.Fatalf("Failed to list browse records: %v", err)
@@ -108,7 +107,7 @@ func TestBrowseHistoryRepository(t *testing.T) {
 		t.Errorf("Expected 1 record, got %d", result.Total)
 	}
 
-	// Test Search
+	// 测试搜索
 	searchResult, err := repo.Search("Updated", &PaginationParams{Page: 1, PageSize: 10})
 	if err != nil {
 		t.Fatalf("Failed to search browse records: %v", err)
@@ -117,7 +116,7 @@ func TestBrowseHistoryRepository(t *testing.T) {
 		t.Errorf("Expected 1 search result, got %d", searchResult.Total)
 	}
 
-	// Test Delete
+	// 测试删除
 	err = repo.Delete("test-video-1")
 	if err != nil {
 		t.Fatalf("Failed to delete browse record: %v", err)
@@ -135,7 +134,7 @@ func TestDownloadRecordRepository(t *testing.T) {
 
 	repo := NewDownloadRecordRepository()
 
-	// Test Create
+	// 测试创建
 	record := &DownloadRecord{
 		ID:           "download-1",
 		VideoID:      "video-1",
@@ -155,7 +154,7 @@ func TestDownloadRecordRepository(t *testing.T) {
 		t.Fatalf("Failed to create download record: %v", err)
 	}
 
-	// Test GetByID
+	// 测试根据 ID 获取
 	retrieved, err := repo.GetByID("download-1")
 	if err != nil {
 		t.Fatalf("Failed to get download record: %v", err)
@@ -167,7 +166,7 @@ func TestDownloadRecordRepository(t *testing.T) {
 		t.Errorf("Expected status '%s', got '%s'", DownloadStatusCompleted, retrieved.Status)
 	}
 
-	// Test List with filter
+	// 测试带过滤的列表
 	result, err := repo.List(&FilterParams{
 		PaginationParams: PaginationParams{Page: 1, PageSize: 10, SortDesc: true},
 		Status:           DownloadStatusCompleted,
@@ -179,7 +178,7 @@ func TestDownloadRecordRepository(t *testing.T) {
 		t.Errorf("Expected 1 record, got %d", result.Total)
 	}
 
-	// Test CountToday
+	// 测试统计今天
 	count, err := repo.CountToday()
 	if err != nil {
 		t.Fatalf("Failed to count today's downloads: %v", err)
@@ -189,13 +188,43 @@ func TestDownloadRecordRepository(t *testing.T) {
 	}
 }
 
+func TestDownloadRecordRepositoryCountsStoredLocalDate(t *testing.T) {
+	cleanup := setupTestDB(t)
+	defer cleanup()
+
+	repo := NewDownloadRecordRepository()
+	localTime := time.Date(2026, time.August, 24, 0, 30, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	record := &DownloadRecord{
+		ID:           "download-local-date",
+		VideoID:      "video-local-date",
+		Title:        "Local Date Boundary",
+		Status:       DownloadStatusCompleted,
+		DownloadTime: localTime,
+	}
+	if err := repo.Create(record); err != nil {
+		t.Fatalf("Failed to create local-date download record: %v", err)
+	}
+	var storedDownloadTime string
+	if err := repo.db.QueryRow("SELECT download_time FROM download_records WHERE id = ?", record.ID).Scan(&storedDownloadTime); err != nil {
+		t.Fatalf("Failed to read stored download time: %v", err)
+	}
+
+	count, err := repo.countByLocalDate("2026-08-24")
+	if err != nil {
+		t.Fatalf("Failed to count downloads by stored local date: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("Expected 1 download on stored local date, got %d (stored value %q)", count, storedDownloadTime)
+	}
+}
+
 func TestQueueRepository(t *testing.T) {
 	cleanup := setupTestDB(t)
 	defer cleanup()
 
 	repo := NewQueueRepository()
 
-	// Test Add
+	// 测试添加
 	item := &QueueItem{
 		ID:        "queue-1",
 		VideoID:   "video-1",
@@ -214,7 +243,7 @@ func TestQueueRepository(t *testing.T) {
 		t.Fatalf("Failed to add queue item: %v", err)
 	}
 
-	// Test GetByID
+	// 测试根据 ID 获取
 	retrieved, err := repo.GetByID("queue-1")
 	if err != nil {
 		t.Fatalf("Failed to get queue item: %v", err)
@@ -223,7 +252,7 @@ func TestQueueRepository(t *testing.T) {
 		t.Fatal("Expected item, got nil")
 	}
 
-	// Test UpdateStatus
+	// 测试更新状态
 	err = repo.UpdateStatus("queue-1", QueueStatusDownloading)
 	if err != nil {
 		t.Fatalf("Failed to update status: %v", err)
@@ -234,7 +263,7 @@ func TestQueueRepository(t *testing.T) {
 		t.Errorf("Expected status '%s', got '%s'", QueueStatusDownloading, retrieved.Status)
 	}
 
-	// Test Reorder
+	// 测试重新排序
 	item2 := &QueueItem{
 		ID:        "queue-2",
 		VideoID:   "video-2",
@@ -254,7 +283,7 @@ func TestQueueRepository(t *testing.T) {
 		t.Fatalf("Failed to reorder queue: %v", err)
 	}
 
-	// Test List (should be ordered by priority)
+	// 测试列表（应按优先级排序）
 	items, err := repo.List()
 	if err != nil {
 		t.Fatalf("Failed to list queue: %v", err)
@@ -270,7 +299,7 @@ func TestSettingsRepository(t *testing.T) {
 
 	repo := NewSettingsRepository()
 
-	// Test Load (default settings)
+	// 测试加载（默认设置）
 	settings, err := repo.Load()
 	if err != nil {
 		t.Fatalf("Failed to load settings: %v", err)
@@ -279,15 +308,16 @@ func TestSettingsRepository(t *testing.T) {
 		t.Errorf("Expected default download dir 'downloads', got '%s'", settings.DownloadDir)
 	}
 
-	// Test Save
+	// 测试保存
 	settings.DownloadDir = "/custom/downloads"
+	settings.DownloadFilenameWithVideoID = false
 	settings.ConcurrentLimit = 5
 	err = repo.Save(settings)
 	if err != nil {
 		t.Fatalf("Failed to save settings: %v", err)
 	}
 
-	// Test Load after save
+	// 测试保存后加载
 	loaded, err := repo.Load()
 	if err != nil {
 		t.Fatalf("Failed to load settings after save: %v", err)
@@ -295,11 +325,14 @@ func TestSettingsRepository(t *testing.T) {
 	if loaded.DownloadDir != "/custom/downloads" {
 		t.Errorf("Expected download dir '/custom/downloads', got '%s'", loaded.DownloadDir)
 	}
+	if loaded.DownloadFilenameWithVideoID {
+		t.Errorf("Expected downloadFilenameWithVideoId false, got true")
+	}
 	if loaded.ConcurrentLimit != 5 {
 		t.Errorf("Expected concurrent limit 5, got %d", loaded.ConcurrentLimit)
 	}
 
-	// Test Validate
+	// 测试验证
 	invalidSettings := &Settings{
 		ChunkSize:       500000, // Too small (< 1MB)
 		ConcurrentLimit: 3,

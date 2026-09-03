@@ -2,42 +2,62 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	htmlstd "html"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"wx_channel/internal/config"
+	"wx_channel/internal/officialaccount"
 	"wx_channel/internal/utils"
 
 	"wx_channel/pkg/util"
 
 	"github.com/qtgolang/SunnyNet/SunnyNet"
+	sunnyPublic "github.com/qtgolang/SunnyNet/public"
 )
 
 // ScriptHandler JavaScript注入处理器
 type ScriptHandler struct {
-	coreJS           []byte
-	decryptJS        []byte
-	downloadJS       []byte
-	homeJS           []byte
-	feedJS           []byte
-	profileJS        []byte
-	searchJS         []byte
-	batchDownloadJS  []byte
-	zipJS            []byte
-	fileSaverJS      []byte
-	mittJS           []byte
-	eventbusJS       []byte
-	utilsJS          []byte
-	apiClientJS      []byte
-	version          string
+	coreJS                []byte
+	decryptJS             []byte
+	downloadJS            []byte
+	homeJS                []byte
+	feedJS                []byte
+	profileJS             []byte
+	batchDownloadJS       []byte
+	zipJS                 []byte
+	fileSaverJS           []byte
+	mittJS                []byte
+	eventbusJS            []byte
+	utilsJS               []byte
+	apiClientJS           []byte
+	keepAliveJS           []byte
+	officialAccountJS     []byte
+	officialAccountOrigin string
+	officialAccountToken  string
+	version               string
+}
+
+var officialAccountCSPNoncePattern = regexp.MustCompile(`(?i)(?:'nonce-|nonce-)([^'";\s]+)`)
+
+// SetOfficialAccountScript enables the isolated public-account page injection.
+func (h *ScriptHandler) SetOfficialAccountScript(script []byte, origin, token string) {
+	if h == nil {
+		return
+	}
+	h.officialAccountJS = script
+	h.officialAccountOrigin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	h.officialAccountToken = strings.TrimSpace(token)
 }
 
 // NewScriptHandler 创建脚本处理器
-func NewScriptHandler(cfg *config.Config, coreJS, decryptJS, downloadJS, homeJS, feedJS, profileJS, searchJS, batchDownloadJS, zipJS, fileSaverJS, mittJS, eventbusJS, utilsJS, apiClientJS []byte, version string) *ScriptHandler {
+func NewScriptHandler(cfg *config.Config, coreJS, decryptJS, downloadJS, homeJS, feedJS, profileJS, batchDownloadJS, zipJS, fileSaverJS, mittJS, eventbusJS, utilsJS, apiClientJS, keepAliveJS []byte, version string) *ScriptHandler {
 	return &ScriptHandler{
 		coreJS:          coreJS,
 		decryptJS:       decryptJS,
@@ -45,7 +65,6 @@ func NewScriptHandler(cfg *config.Config, coreJS, decryptJS, downloadJS, homeJS,
 		homeJS:          homeJS,
 		feedJS:          feedJS,
 		profileJS:       profileJS,
-		searchJS:        searchJS,
 		batchDownloadJS: batchDownloadJS,
 		zipJS:           zipJS,
 		fileSaverJS:     fileSaverJS,
@@ -53,6 +72,7 @@ func NewScriptHandler(cfg *config.Config, coreJS, decryptJS, downloadJS, homeJS,
 		eventbusJS:      eventbusJS,
 		utilsJS:         utilsJS,
 		apiClientJS:     apiClientJS,
+		keepAliveJS:     keepAliveJS,
 		version:         version,
 	}
 }
@@ -62,10 +82,57 @@ func (h *ScriptHandler) getConfig() *config.Config {
 	return config.Get()
 }
 
+// Handle implements router.Interceptor
+func (h *ScriptHandler) Handle(Conn *SunnyNet.HttpConn) bool {
+
+	if Conn.Type != sunnyPublic.HttpResponseOK {
+		return false
+	}
+
+	// 防御性检查
+	if Conn.Request == nil || Conn.Request.URL == nil {
+		return false
+	}
+
+	// 只有响应成功且有内容才处理
+	if Conn.Response == nil || Conn.Response.Body == nil {
+		return false
+	}
+
+	// 读取响应体
+	// 注意：这里读取了Body，如果未被修改，需要重新赋值回去
+	body, err := io.ReadAll(Conn.Response.Body)
+	if err != nil {
+		return false
+	}
+	_ = Conn.Response.Body.Close()
+
+	host := Conn.Request.URL.Hostname()
+	path := Conn.Request.URL.Path
+
+	// 记录所有JS文件的加载（简略日志）
+	if strings.HasSuffix(path, ".js") {
+		contentType := strings.ToLower(Conn.Response.Header.Get("content-type"))
+		utils.LogFileInfo("[响应] Path=%s | ContentType=%s", path, contentType)
+	}
+
+	if h.HandleHTMLResponse(Conn, host, path, body) {
+		return true
+	}
+
+	if h.HandleJavaScriptResponse(Conn, host, path, body) {
+		return true
+	}
+
+	// 如果没有处理，恢复Body
+	Conn.Response.Body = io.NopCloser(bytes.NewBuffer(body))
+	return false
+}
+
 // HandleHTMLResponse 处理HTML响应，注入JavaScript代码
 func (h *ScriptHandler) HandleHTMLResponse(Conn *SunnyNet.HttpConn, host, path string, body []byte) bool {
 	contentType := strings.ToLower(Conn.Response.Header.Get("content-type"))
-	if contentType != "text/html; charset=utf-8" {
+	if !isHTMLContentType(contentType) {
 		return false
 	}
 
@@ -78,13 +145,38 @@ func (h *ScriptHandler) HandleHTMLResponse(Conn *SunnyNet.HttpConn, host, path s
 	html = scriptReg2.ReplaceAllString(html, `href="$1.js`+h.version+`"`)
 	Conn.Response.Header.Set("__debug", "append_script")
 
-	if host == "channels.weixin.qq.com" && (path == "/web/pages/feed" || path == "/web/pages/home" || path == "/web/pages/profile" || path == "/web/pages/s") {
+	if host == "channels.weixin.qq.com" && (path == "/web/pages/feed" || path == "/web/pages/home" || path == "/web/pages/profile" || path == "/web/pages/account/like") {
 		// 根据页面路径注入不同的脚本
 		injectedScripts := h.buildInjectedScripts(path)
 		html = strings.Replace(html, "<head>", "<head>\n"+injectedScripts, 1)
-		utils.Info("页面已成功加载！")
-		utils.Info("已添加视频缓存监控和提醒功能")
-		utils.LogInfo("[页面加载] 视频号页面已加载 | Host=%s | Path=%s", host, path)
+		utils.LogFileInfo("页面已成功加载！")
+		utils.LogFileInfo("已添加视频缓存监控和提醒功能")
+		utils.LogFileInfo("[页面加载] 视频号页面已加载 | Host=%s | Path=%s", host, path)
+		Conn.Response.Body = io.NopCloser(bytes.NewBuffer([]byte(html)))
+		return true
+	}
+
+	if host == "mp.weixin.qq.com" && h.hasOfficialAccountPage(path) {
+		biz := ""
+		if Conn.Request != nil && Conn.Request.URL != nil {
+			query := Conn.Request.URL.Query()
+			biz = firstNonEmpty(query.Get("__biz"), query.Get("biz"))
+		}
+		nonce := officialAccountCSPNonce(Conn.Response.Header)
+		injected := h.buildOfficialAccountInjection(biz, nonce)
+		lowerHTML := strings.ToLower(html)
+		if bodyIndex := strings.LastIndex(lowerHTML, "</body>"); bodyIndex >= 0 {
+			html = html[:bodyIndex] + injected + html[bodyIndex:]
+		} else if headIndex := strings.Index(lowerHTML, "</head>"); headIndex >= 0 {
+			html = html[:headIndex] + injected + html[headIndex:]
+		} else {
+			html = injected + html
+		}
+		Conn.Response.Header.Set("__debug", "append_official_account_script")
+		if nonce != "" {
+			utils.LogFileInfo("[脚本注入] 公众号页面检测到 CSP nonce，已应用到采集脚本")
+		}
+		utils.LogFileInfo("[脚本注入] 公众号文章页面已注入采集脚本 | Host=%s | Path=%s", host, path)
 		Conn.Response.Body = io.NopCloser(bytes.NewBuffer([]byte(html)))
 		return true
 	}
@@ -93,15 +185,47 @@ func (h *ScriptHandler) HandleHTMLResponse(Conn *SunnyNet.HttpConn, host, path s
 	return true
 }
 
+func (h *ScriptHandler) hasOfficialAccountPage(path string) bool {
+	if len(h.officialAccountJS) == 0 {
+		return false
+	}
+	return officialaccount.IsOfficialAccountPath(path)
+}
+
+func officialAccountCSPNonce(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	for _, name := range []string{"Content-Security-Policy", "Content-Security-Policy-Report-Only"} {
+		if match := officialAccountCSPNoncePattern.FindStringSubmatch(headers.Get(name)); len(match) > 1 {
+			return strings.TrimSpace(match[1])
+		}
+	}
+	return ""
+}
+
+func (h *ScriptHandler) buildOfficialAccountInjection(biz, nonce string) string {
+	config, _ := json.Marshal(map[string]string{
+		"origin": h.officialAccountOrigin,
+		"token":  h.officialAccountToken,
+		"biz":    strings.TrimSpace(biz),
+	})
+	attrs := ""
+	if nonce != "" {
+		attrs = ` nonce="` + htmlstd.EscapeString(nonce) + `"`
+	}
+	return fmt.Sprintf(`<script%s>window.__wx_channels_mp_config__=%s;</script><script%s>%s</script>`, attrs, config, attrs, string(h.officialAccountJS))
+}
+
 // HandleJavaScriptResponse 处理JavaScript响应，修改JavaScript代码
 func (h *ScriptHandler) HandleJavaScriptResponse(Conn *SunnyNet.HttpConn, host, path string, body []byte) bool {
 	contentType := strings.ToLower(Conn.Response.Header.Get("content-type"))
-	if contentType != "application/javascript" {
+	if !isJavaScriptContentType(contentType) {
 		return false
 	}
 
 	// 记录所有JS文件的加载（用于调试）
-	utils.LogInfo("[JS文件] %s", path)
+	utils.LogFileInfo("[JS文件] %s", path)
 
 	// 保存关键的 JS 文件到本地以便分析
 	h.saveJavaScriptFile(path, body)
@@ -130,11 +254,7 @@ func (h *ScriptHandler) HandleJavaScriptResponse(Conn *SunnyNet.HttpConn, host, 
 		Conn.Response.Body = io.NopCloser(bytes.NewBuffer([]byte(content)))
 		return true
 	}
-	content, handled = h.handleFeedDetail(path, content)
-	if handled {
-		Conn.Response.Body = io.NopCloser(bytes.NewBuffer([]byte(content)))
-		return true
-	}
+
 	content, handled = h.handleWorkerRelease(path, content)
 	if handled {
 		Conn.Response.Body = io.NopCloser(bytes.NewBuffer([]byte(content)))
@@ -162,14 +282,17 @@ func (h *ScriptHandler) buildInjectedScripts(path string) string {
 	// API 客户端脚本 - 必须在其他脚本之前加载
 	apiClientScript := fmt.Sprintf(`<script>%s</script>`, string(h.apiClientJS))
 
+	// 页面保活脚本 - 防止页面休眠
+	keepAliveScript := fmt.Sprintf(`<script>%s</script>`, string(h.keepAliveJS))
+
 	// 模块化脚本 - 按依赖顺序加载
+	fileSaverInlineScript := fmt.Sprintf(`<script>%s</script>`, string(h.fileSaverJS))
 	coreScript := fmt.Sprintf(`<script>%s</script>`, string(h.coreJS))
 	decryptScript := fmt.Sprintf(`<script>%s</script>`, string(h.decryptJS))
 	downloadScript := fmt.Sprintf(`<script>%s</script>`, string(h.downloadJS))
 	batchDownloadScript := fmt.Sprintf(`<script>%s</script>`, string(h.batchDownloadJS))
 	feedScript := fmt.Sprintf(`<script>%s</script>`, string(h.feedJS))
 	profileScript := fmt.Sprintf(`<script>%s</script>`, string(h.profileJS))
-	searchScript := fmt.Sprintf(`<script>%s</script>`, string(h.searchJS))
 	homeScript := fmt.Sprintf(`<script>%s</script>`, string(h.homeJS))
 
 	// 预加载FileSaver.js库 - 所有页面都需要
@@ -185,31 +308,29 @@ func (h *ScriptHandler) buildInjectedScripts(path string) string {
 	savePageContentScript := h.getSavePageContentScript()
 
 	// 基础脚本（所有页面都需要）
-	baseScripts := logPanelScript + mittScript + eventbusScript + utilsScript + apiClientScript + coreScript + decryptScript + downloadScript + batchDownloadScript + feedScript + profileScript + searchScript + homeScript + preloadScript + downloadTrackerScript + captureUrlScript + savePageContentScript
+	baseScripts := logPanelScript + mittScript + eventbusScript + utilsScript + apiClientScript + keepAliveScript + fileSaverInlineScript + coreScript + decryptScript + downloadScript + batchDownloadScript + feedScript + profileScript + homeScript + preloadScript + downloadTrackerScript + captureUrlScript + savePageContentScript
 
 	// 根据页面路径决定是否注入特定脚本
 	var pageSpecificScripts string
 
 	switch path {
 	case "/web/pages/home":
-		// Home页面：注入视频缓存监控脚本
 		pageSpecificScripts = h.getVideoCacheNotificationScript()
-		utils.LogInfo("[脚本注入] Home页面 - 注入事件系统和视频缓存监控脚本")
+		utils.LogFileInfo("[脚本注入] Home页面 - 注入视频缓存监控脚本")
 
 	case "/web/pages/profile":
 		// Profile页面（视频列表）：不需要特定脚本
 		pageSpecificScripts = ""
-		utils.LogInfo("[脚本注入] Profile页面 - 仅注入基础脚本")
+		utils.LogFileInfo("[脚本注入] Profile页面 - 仅注入基础脚本")
+
+	case "/web/pages/account/like":
+		// 赞过页面会加载被全局改写的公共 bundle，需要基础脚本环境避免 WXU/WXE 未定义
+		pageSpecificScripts = ""
+		utils.LogFileInfo("[脚本注入] Account Like页面 - 注入基础脚本以兼容公共 JS 事件")
 
 	case "/web/pages/feed":
-		// Feed页面（视频详情）：注入视频缓存监控和评论采集脚本
-		pageSpecificScripts = h.getVideoCacheNotificationScript() + h.getCommentCaptureScript()
-		utils.LogInfo("[脚本注入] Feed页面 - 注入视频缓存监控和评论采集脚本")
-
-	case "/web/pages/s":
-		// 搜索页面：注入搜索模块
-		pageSpecificScripts = searchScript
-		utils.LogInfo("[脚本注入] 搜索页面 - 注入搜索模块（事件系统）")
+		pageSpecificScripts = h.getVideoCacheNotificationScript()
+		utils.LogFileInfo("[脚本注入] Feed页面 - 注入视频缓存监控脚本")
 
 	default:
 		// 其他页面：不注入页面特定脚本
@@ -236,29 +357,13 @@ setTimeout(function() {
 // getPreloadScript 获取预加载FileSaver.js库的脚本
 func (h *ScriptHandler) getPreloadScript() string {
 	return `<script>
-	// 预加载FileSaver.js库
-	(function() {
-		const script = document.createElement('script');
-		script.src = '/FileSaver.min.js';
-		document.head.appendChild(script);
-	})();
+	// FileSaver 已内联注入，保留空预加载占位避免旧逻辑报错
 	</script>`
 }
 
 // getDownloadTrackerScript 获取下载记录功能的脚本
 func (h *ScriptHandler) getDownloadTrackerScript() string {
 	return `<script>
-	// 确保FileSaver.js库已加载
-	if (typeof saveAs === 'undefined') {
-		console.log('加载FileSaver.js库');
-		const script = document.createElement('script');
-		script.src = '/FileSaver.min.js';
-		script.onload = function() {
-			console.log('FileSaver.js库加载成功');
-		};
-		document.head.appendChild(script);
-	}
-
 	// 跟踪已记录的下载，防止重复记录
 	window.__wx_channels_recorded_downloads = {};
 
@@ -453,7 +558,7 @@ func (h *ScriptHandler) getDownloadTrackerScript() string {
 					const path = data.relativePath || data.path || '';
 					if (window.__wx_log) {
 						window.__wx_log({
-							msg: '✓ ' + msg + (path ? '\n路径: ' + path : '')
+							msg: '✓ ' + msg
 						});
 					}
 					console.log('✓ [封面下载] 封面已保存:', path);
@@ -506,11 +611,41 @@ func (h *ScriptHandler) getCaptureUrlScript() string {
 // getSavePageContentScript 获取保存页面内容的脚本
 func (h *ScriptHandler) getSavePageContentScript() string {
 	return `<script>
-	// 保存当前页面完整内容的函数
-	window.__wx_channels_save_page_content = function() {
+	// 简单的字符串哈希函数 (djb2算法)
+	function computeHash(str) {
+		var hash = 5381;
+		var i = str.length;
+		while(i) {
+			hash = (hash * 33) ^ str.charCodeAt(--i);
+		}
+		return hash >>> 0; // 强制转换为无符号32位整数
+	}
+
+	// 状态变量
+	window.__wx_last_saved_hash = 0;
+	window.__wx_save_timer = null;
+
+	// 保存当前页面完整内容的函数 (带去重和防抖)
+	window.__wx_channels_save_page_content = function(force) {
 		try {
+			// 清除之前的定时器
+			if (window.__wx_save_timer) {
+				clearTimeout(window.__wx_save_timer);
+				window.__wx_save_timer = null;
+			}
+
 			// 获取当前完整的HTML内容
 			var fullHtml = document.documentElement.outerHTML;
+			
+			// 计算哈希
+			var currentHash = computeHash(fullHtml);
+
+			// 如果不是强制保存，且哈希值与上次相同，则跳过
+			if (!force && currentHash === window.__wx_last_saved_hash) {
+				// console.log("[PageSave] 内容未变化，跳过保存");
+				return;
+			}
+
 			var currentUrl = window.location.href;
 			
 			// 发送到保存API
@@ -526,25 +661,37 @@ func (h *ScriptHandler) getSavePageContentScript() string {
 				})
 			}).then(response => {
 				if (response.ok) {
-					console.log("页面内容已保存");
+					console.log("[PageSave] 页面内容已保存");
+					window.__wx_last_saved_hash = currentHash;
 				}
 			}).catch(error => {
-				console.error("保存页面内容失败:", error);
+				console.error("[PageSave] 保存页面内容失败:", error);
 			});
 		} catch (error) {
-			console.error("获取页面内容失败:", error);
+			console.error("[PageSave] 获取页面内容失败:", error);
 		}
 	};
 	
+	// 触发带防抖的保存 (默认延迟2秒)
+	window.__wx_trigger_save_page = function(delay) {
+		if (typeof delay === 'undefined') delay = 2000;
+		
+		if (window.__wx_save_timer) {
+			clearTimeout(window.__wx_save_timer);
+		}
+		
+		window.__wx_save_timer = setTimeout(function() {
+			window.__wx_channels_save_page_content(false);
+		}, delay);
+	};
+
 	// 监听URL变化，自动保存页面内容
 	let currentPageUrl = window.location.href;
 	const checkUrlChange = () => {
 		if (window.location.href !== currentPageUrl) {
 			currentPageUrl = window.location.href;
-			// URL变化后延迟保存，等待内容加载（增加到8秒，确保下载菜单已注入）
-			setTimeout(() => {
-				window.__wx_channels_save_page_content();
-			}, 8000);
+			// URL变化后延迟保存，等待内容加载
+			window.__wx_trigger_save_page(5000);
 		}
 	};
 	
@@ -553,15 +700,13 @@ func (h *ScriptHandler) getSavePageContentScript() string {
 	
 	// 监听历史记录变化
 	window.addEventListener('popstate', () => {
-		setTimeout(() => {
-			window.__wx_channels_save_page_content();
-		}, 8000);
+		window.__wx_trigger_save_page(3000);
 	});
 	
-	// 在页面加载完成后也保存一次（增加到10秒，确保所有内容都已加载）
+	// 在页面加载完成后也保存一次
 	setTimeout(() => {
-		window.__wx_channels_save_page_content();
-	}, 10000);
+		window.__wx_trigger_save_page(2000);
+	}, 8000);
 	</script>`
 }
 
@@ -1138,7 +1283,7 @@ func (h *ScriptHandler) handleIndexPublish(path string, content string) (string,
 		return content, false
 	}
 
-	utils.LogInfo("[Home数据采集] 正在处理 index.publish 文件")
+	utils.LogFileInfo("[Home数据采集] 正在处理 index.publish 文件")
 
 	regexp1 := regexp.MustCompile(`this.sourceBuffer.appendBuffer\(h\),`)
 	replaceStr1 := `(() => {
@@ -1151,10 +1296,11 @@ if (window.__wx_channels_video_cache_monitor) {
 }
 })(),this.sourceBuffer.appendBuffer(h),`
 	if regexp1.MatchString(content) {
-		utils.Info("视频播放已成功加载！")
-		utils.Info("视频缓冲将被监控，完成时会有提醒")
-		utils.LogInfo("[视频播放] 视频播放器已加载 | Path=%s", path)
+		utils.LogFileInfo("视频播放已成功加载！")
+		utils.LogFileInfo("视频缓冲将被监控，完成时会有提醒")
+		utils.LogFileInfo("[视频播放] 视频播放器已加载 | Path=%s", path)
 	}
+	logInjectPatternResult("sourceBuffer.appendBuffer", path, regexp1.MatchString(content))
 	content = regexp1.ReplaceAllString(content, replaceStr1)
 	regexp2 := regexp.MustCompile(`if\(f.cmd===re.MAIN_THREAD_CMD.AUTO_CUT`)
 	replaceStr2 := `if(f.cmd==="CUT"){
@@ -1164,6 +1310,7 @@ if (window.__wx_channels_video_cache_monitor) {
 	}
 }
 if(f.cmd===re.MAIN_THREAD_CMD.AUTO_CUT`
+	logInjectPatternResult("AUTO_CUT", path, regexp2.MatchString(content))
 	content = regexp2.ReplaceAllString(content, replaceStr2)
 
 	return content, true
@@ -1175,104 +1322,75 @@ func (h *ScriptHandler) handleVirtualSvgIcons(path string, content string) (stri
 		return content, false
 	}
 
-	// 拦截 finderPcFlow - 首页推荐视频列表（参考 wx_channels_download 项目）
-	pcFlowRegex := regexp.MustCompile(`async finderPcFlow\((\w+)\)\{(.*?)\}async`)
-	if pcFlowRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderPcFlow 函数")
-		pcFlowReplace := `async finderPcFlow($1){var result=await(async()=>{$2})();var feeds=result.data.object;console.log("before PCFlowLoaded",result.data);WXU.emit(WXU.Events.PCFlowLoaded,feeds);return result;}async`
-		content = pcFlowRegex.ReplaceAllString(content, pcFlowReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderPcFlow 函数")
+	// 2026-03-13: 首页改版后，finderPcFlow/finderStream/finderGetRecommend 所在链路
+	// 对首屏当前标签的初始化更敏感。这里暂时停用首页流相关的源码重写，
+	// 先保证 Home 页面刷新和首屏加载稳定，保留 feed/profile/search 等稳定链路。
+	if strings.Contains(content, "finderPcFlow(") {
+		utils.LogFileInfo("[API拦截] ⏭️ 跳过 finderPcFlow 重写，避免干扰新版 Home 首屏初始化")
+	}
+	if strings.Contains(content, "finderStream(") {
+		utils.LogFileInfo("[API拦截] ⏭️ 跳过 finderStream 重写，避免干扰新版 Home 首屏初始化")
 	}
 
 	// 拦截 finderGetCommentDetail - 视频详情（参考 wx_channels_download 项目）
-	feedProfileRegex := regexp.MustCompile(`async finderGetCommentDetail\((\w+)\)\{(.*?)\}async`)
-	if feedProfileRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderGetCommentDetail 函数")
-		feedProfileReplace := `async finderGetCommentDetail($1){var result=await(async()=>{$2})();var feed=result.data.object;console.log("before FeedProfileLoaded",result.data);WXU.emit(WXU.Events.FeedProfileLoaded,feed);return result;}async`
+	feedProfileRegex := regexp.MustCompile(`(?s)async\s+finderGetCommentDetail\s*\(([^)]+)\)\s*\{(.*?)\}\s*async`)
+	feedProfileMatched := feedProfileRegex.MatchString(content)
+	logInjectPatternResult("finderGetCommentDetail", path, feedProfileMatched)
+	if feedProfileMatched {
+		utils.LogFileInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderGetCommentDetail 函数")
+		feedProfileReplace := `async finderGetCommentDetail($1){var result=await(async()=>{$2})();var feed=result.data.object;console.log("[API拦截] finderGetCommentDetail 触发 FeedProfileLoaded");WXU.emit(WXU.Events.FeedProfileLoaded,feed);return result;}async`
 		content = feedProfileRegex.ReplaceAllString(content, feedProfileReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderGetCommentDetail 函数")
+	}
+
+	commentListRegex := regexp.MustCompile(`(?s)async\s+finderGetCommentList\s*\(([^)]+)\)\s*\{(.*?)\}\s*async`)
+	commentListMatched := commentListRegex.MatchString(content)
+	logInjectPatternResult("finderGetCommentList", path, commentListMatched)
+	if commentListMatched {
+		utils.LogFileInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderGetCommentList 函数")
+		commentListReplace := `async finderGetCommentList($1){var result=await(async()=>{$2})();console.log("[API拦截] finderGetCommentList 返回评论列表");WXU.emit(WXU.Events.FeedCommentListLoaded,result.data);return result;}async`
+		content = commentListRegex.ReplaceAllString(content, commentListReplace)
 	}
 
 	// 拦截 Profile 页面的视频列表数据 - 使用事件系统（参考 wx_channels_download 项目）
-	profileListRegex := regexp.MustCompile(`async finderUserPage\((\w+)\)\{return(.*?)\}async`)
-	if profileListRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderUserPage 函数")
-		// 添加空值检查和详细日志
+	profileListRegex := regexp.MustCompile(`(?s)async\s+finderUserPage\s*\(([^)]+)\)\s*\{return(.*?)\}\s*async`)
+	profileListMatched := profileListRegex.MatchString(content)
+	logInjectPatternResult("finderUserPage", path, profileListMatched)
+	if profileListMatched {
+		utils.LogFileInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderUserPage 函数")
 		profileListReplace := `async finderUserPage($1){console.log("[Profile API] finderUserPage 调用参数:",$1);var result=await(async()=>{return$2})();console.log("[Profile API] finderUserPage 原始结果:",result);if(result&&result.data&&result.data.object){var feeds=result.data.object;console.log("[Profile API] 提取到",feeds.length,"个视频");WXU.emit(WXU.Events.UserFeedsLoaded,feeds);}else{console.warn("[Profile API] result.data.object 为空",result);}return result;}async`
 		content = profileListRegex.ReplaceAllString(content, profileListReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderUserPage 函数")
 	}
 
 	// 拦截 Profile 页面的直播回放列表数据 - 使用事件系统
-	liveListRegex := regexp.MustCompile(`async finderLiveUserPage\((\w+)\)\{return(.*?)\}async`)
-	if liveListRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderLiveUserPage 函数")
-		// 添加空值检查和详细日志
+	liveListRegex := regexp.MustCompile(`(?s)async\s+finderLiveUserPage\s*\(([^)]+)\)\s*\{return(.*?)\}\s*async`)
+	liveListMatched := liveListRegex.MatchString(content)
+	logInjectPatternResult("finderLiveUserPage", path, liveListMatched)
+	if liveListMatched {
+		utils.LogFileInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderLiveUserPage 函数")
 		liveListReplace := `async finderLiveUserPage($1){console.log("[Profile API] finderLiveUserPage 调用参数:",$1);var result=await(async()=>{return$2})();console.log("[Profile API] finderLiveUserPage 原始结果:",result);if(result&&result.data&&result.data.object){var feeds=result.data.object;console.log("[Profile API] 提取到",feeds.length,"个直播回放");WXU.emit(WXU.Events.UserLiveReplayLoaded,feeds);}else{console.warn("[Profile API] result.data.object 为空",result);}return result;}async`
 		content = liveListRegex.ReplaceAllString(content, liveListReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderLiveUserPage 函数")
 	}
 
-	// 拦截分类视频列表API - finderGetRecommend（首页、美食、生活等分类tab）
-	// 函数格式: async finderGetRecommend(t){...return r}async
-	categoryFeedsRegex := regexp.MustCompile(`async finderGetRecommend\((\w+)\)\{(.*?)\}async`)
-	if categoryFeedsRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderGetRecommend 函数")
-		// 拦截返回结果，提取视频列表数据并触发事件
-		// 注意：这个API可能用于多个场景（推荐tab、分类tab等），页面会预加载多个分类的数据
-		// 将API调用参数一起传递，前端根据tagName匹配当前选中的tab
-		categoryFeedsReplace := `async finderGetRecommend($1){var result=await(async()=>{$2})();if(result&&result.data&&result.data.object){var feeds=result.data.object;WXU.emit(WXU.Events.CategoryFeedsLoaded,{feeds:feeds,params:$1});}return result;}async`
-		content = categoryFeedsRegex.ReplaceAllString(content, categoryFeedsReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderGetRecommend 函数")
-	}
-
-	// 拦截搜索API - finderPCSearch（PC端搜索）
-	// 函数格式: async finderPCSearch(n){...return(...),t}async
-	// 在最后的 return 之前插入代码，然后保持 ,t}async 不变
-	searchPCRegex := regexp.MustCompile(`(async finderPCSearch\([^)]+\)\{.*?)(,t\}async)`)
-	
-	if searchPCRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderPCSearch 函数")
-		// 在 ,t 之前插入代码，保持 ,t}async 完整
-		// 从 acctList 中提取正在直播的账号，添加调试日志
-		searchPCReplace := `$1,t&&t.data&&(function(){var lives=t.data.liveObjectList||[];var accounts=[];var liveCount=0;if(t.data.acctList){t.data.acctList.forEach(function(info){if(info.liveStatus===1){liveCount++;console.log("[搜索API] 发现直播账号:",info.contact?info.contact.nickname:"未知",info.liveStatus,info.liveInfo);}if(info.liveStatus===1&&info.liveInfo){lives.push({id:info.contact.username,objectId:info.contact.username,nickname:info.contact.nickname,username:info.contact.username,description:info.liveInfo.description||"",streamUrl:info.liveInfo.streamUrl,coverUrl:info.liveInfo.media&&info.liveInfo.media[0]?info.liveInfo.media[0].thumbUrl:"",thumbUrl:info.liveInfo.media&&info.liveInfo.media[0]?info.liveInfo.media[0].thumbUrl:"",liveInfo:info.liveInfo,type:"live"});}accounts.push(info);});}if(liveCount>0){console.log("[搜索API] 共发现",liveCount,"个直播账号，成功提取",lives.length,"个");}var searchData={feeds:t.data.objectList||[],accounts:accounts,lives:lives};WXU.emit("SearchResultLoaded",searchData);})()$2`
-		content = searchPCRegex.ReplaceAllString(content, searchPCReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderPCSearch 函数")
-	}
-
-	// 拦截搜索API - finderSearch（移动端搜索）
-	// 使用非贪婪匹配，匹配到最后的 ,t}async 模式
-	searchRegex := regexp.MustCompile(`(async finderSearch\([^)]+\)\{.*?)(,t\}async)`)
-	
-	if searchRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中成功拦截 finderSearch 函数")
-		// 从 infoList 中提取正在直播的账号，添加调试日志
-		searchReplace := `$1,t&&t.data&&(function(){var lives=[];var accounts=[];var liveCount=0;if(t.data.infoList){t.data.infoList.forEach(function(info){if(info.liveStatus===1){liveCount++;console.log("[搜索API] 发现直播账号:",info.contact?info.contact.nickname:"未知",info.liveStatus,info.liveInfo);}if(info.liveStatus===1&&info.liveInfo){lives.push({id:info.contact.username,objectId:info.contact.username,nickname:info.contact.nickname,username:info.contact.username,description:info.liveInfo.description||"",streamUrl:info.liveInfo.streamUrl,coverUrl:info.liveInfo.media&&info.liveInfo.media[0]?info.liveInfo.media[0].thumbUrl:"",thumbUrl:info.liveInfo.media&&info.liveInfo.media[0]?info.liveInfo.media[0].thumbUrl:"",liveInfo:info.liveInfo,type:"live"});}accounts.push(info);});}if(liveCount>0){console.log("[搜索API] 共发现",liveCount,"个直播账号，成功提取",lives.length,"个");}var searchData={feeds:t.data.objectList||[],accounts:accounts,lives:lives};WXU.emit("SearchResultLoaded",searchData);})()$2`
-		content = searchRegex.ReplaceAllString(content, searchReplace)
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 finderSearch 函数")
+	if strings.Contains(content, "finderGetRecommend(") {
+		utils.LogFileInfo("[API拦截] ⏭️ 跳过 finderGetRecommend 重写，避免干扰新版 Home 首屏初始化")
 	}
 
 	// 拦截 export 语句，提取所有导出的 API 函数
 	// 格式: export{xxx as yyy,zzz as www,...}
 	exportBlockRegex := regexp.MustCompile(`export\s*\{([^}]+)\}`)
 	exportRegex := regexp.MustCompile(`export\s*\{`)
-	
-	if exportBlockRegex.MatchString(content) {
-		utils.LogInfo("[API拦截] ✅ 在virtual_svg-icons-register中找到 export 语句")
-		
+
+	exportBlockMatched := exportBlockRegex.MatchString(content)
+	logInjectPatternResult("export block", path, exportBlockMatched)
+	if exportBlockMatched {
+		utils.LogFileInfo("[API拦截] ✅ 在virtual_svg-icons-register中找到 export 语句")
+
 		// 提取 export 块中的内容
 		matches := exportBlockRegex.FindStringSubmatch(content)
 		if len(matches) >= 2 {
 			exportContent := matches[1]
-			utils.LogInfo("[API拦截] Export 内容: %s", exportContent[:min(100, len(exportContent))])
-			
+			utils.LogFileInfo("[API拦截] Export 内容: %s", exportContent[:min(100, len(exportContent))])
+
 			// 解析导出的函数名
 			items := strings.Split(exportContent, ",")
 			var locals []string
@@ -1291,21 +1409,19 @@ func (h *ScriptHandler) handleVirtualSvgIcons(path string, content string) (stri
 					locals = append(locals, local)
 				}
 			}
-			
+
 			if len(locals) > 0 {
-				utils.LogInfo("[API拦截] 提取到 %d 个导出函数", len(locals))
+				utils.LogFileInfo("[API拦截] 提取到 %d 个导出函数", len(locals))
 				apiMethods := "{" + strings.Join(locals, ",") + "}"
 				// 转义 $ 符号
 				apiMethodsEscaped := strings.ReplaceAll(apiMethods, "$", "$$")
-				
+
 				// 在 export 之前插入 API 加载事件
 				jsWXAPI := ";WXU.emit(WXU.Events.APILoaded," + apiMethodsEscaped + ");export{"
 				content = exportRegex.ReplaceAllString(content, jsWXAPI)
-				utils.LogInfo("[API拦截] ✅ 已注入 APILoaded 事件")
+				utils.LogFileInfo("[API拦截] ✅ 已注入 APILoaded 事件")
 			}
 		}
-	} else {
-		utils.LogInfo("[API拦截] ❌ 在virtual_svg-icons-register中未找到 export 语句")
 	}
 
 	return content, true
@@ -1319,17 +1435,6 @@ func min(a, b int) int {
 	return b
 }
 
-// handleFeedDetail 处理FeedDetail.publish JS文件
-func (h *ScriptHandler) handleFeedDetail(path string, content string) (string, bool) {
-	if !util.Includes(path, "/t/wx_fed/finder/web/web-finder/res/js/FeedDetail.publish") {
-		return content, false
-	}
-
-	// Feed详情页现在由 feed.js 模块处理，不再需要旧的注入代码
-	utils.LogInfo("[Feed详情] Feed详情页由 feed.js 模块处理")
-	return content, true
-}
-
 // handleWorkerRelease 处理worker_release JS文件
 func (h *ScriptHandler) handleWorkerRelease(path string, content string) (string, bool) {
 	if !util.Includes(path, "worker_release") {
@@ -1338,8 +1443,26 @@ func (h *ScriptHandler) handleWorkerRelease(path string, content string) (string
 
 	regex := regexp.MustCompile(`fmp4Index:p.fmp4Index`)
 	replaceStr := `decryptor_array:p.decryptor_array,fmp4Index:p.fmp4Index`
+	logInjectPatternResult("worker_release fmp4Index", path, regex.MatchString(content))
 	content = regex.ReplaceAllString(content, replaceStr)
 	return content, true
+}
+
+func isHTMLContentType(contentType string) bool {
+	return strings.Contains(strings.ToLower(contentType), "text/html")
+}
+
+func isJavaScriptContentType(contentType string) bool {
+	lower := strings.ToLower(contentType)
+	return strings.Contains(lower, "javascript") || strings.Contains(lower, "ecmascript") || strings.Contains(lower, "text/js")
+}
+
+func logInjectPatternResult(label string, path string, matched bool) {
+	if matched {
+		utils.LogFileInfo("[注入检查] ✅ %s 命中: %s", label, path)
+		return
+	}
+	utils.LogFileInfo("[注入检查] ❌ %s 未命中: %s", label, path)
 }
 
 // handleConnectPublish 处理connect.publish JS文件（参考 wx_channels_download 项目的实现）
@@ -1348,43 +1471,8 @@ func (h *ScriptHandler) handleConnectPublish(Conn *SunnyNet.HttpConn, path strin
 		return content, false
 	}
 
-	utils.LogInfo("[Home数据采集] ✅ 正在处理 connect.publish 文件")
-
-	// 首先找到 flowTab 对应的变量名（可能是 yt, nn 或其他）
-	// 格式: flowTab:变量名,flowTabId:
-	flowTabReg := regexp.MustCompile(`flowTab:([a-zA-Z]{1,}),flowTabId:`)
-	flowTabVar := "yt" // 默认值
-	if matches := flowTabReg.FindStringSubmatch(content); len(matches) > 1 {
-		flowTabVar = matches[1]
-		utils.LogInfo("[Home数据采集] ✅ 找到 flowTab 变量名: %s", flowTabVar)
-	} else {
-		utils.LogInfo("[Home数据采集] ⚠️ 未找到 flowTab 变量名，使用默认值: %s", flowTabVar)
-	}
-
-	// 参考 wx_channels_download 项目的正则表达式，匹配函数定义而不是函数调用
-	// 原始代码格式: goToNextFlowFeed:函数名 或 goToPrevFlowFeed:函数名
-	goToNextFlowReg := regexp.MustCompile(`goToNextFlowFeed:([a-zA-Z]{1,})`)
-	goToPrevFlowReg := regexp.MustCompile(`goToPrevFlowFeed:([a-zA-Z]{1,})`)
-
-	// 替换 goToNextFlowFeed 函数定义 - 使用 WXU.emit 发送事件（与 wx_channels_download 完全一致）
-	if goToNextFlowReg.MatchString(content) {
-		utils.LogInfo("[Home数据采集] ✅ 在connect.publish中成功拦截 goToNextFlowFeed 函数定义")
-		// 使用动态获取的 flowTab 变量名
-		jsGoNextFeed := fmt.Sprintf("goToNextFlowFeed:async function(v){await $1(v);console.log('goToNextFlowFeed',%s);if(!%s||!%s.value.feeds){return;}var feed=%s.value.feeds[%s.value.currentFeedIndex];console.log('before GotoNextFeed',%s,feed);WXU.emit(WXU.Events.GotoNextFeed,feed);}", flowTabVar, flowTabVar, flowTabVar, flowTabVar, flowTabVar, flowTabVar)
-		content = goToNextFlowReg.ReplaceAllString(content, jsGoNextFeed)
-	} else {
-		utils.LogInfo("[Home数据采集] ❌ 在connect.publish中未找到 goToNextFlowFeed 函数定义")
-	}
-
-	// 替换 goToPrevFlowFeed 函数定义 - 使用 WXU.emit 发送事件
-	if goToPrevFlowReg.MatchString(content) {
-		utils.LogInfo("[Home数据采集] ✅ 在connect.publish中成功拦截 goToPrevFlowFeed 函数定义")
-		// 使用动态获取的 flowTab 变量名
-		jsGoPrevFeed := fmt.Sprintf("goToPrevFlowFeed:async function(v){await $1(v);console.log('goToPrevFlowFeed',%s);if(!%s||!%s.value.feeds){return;}var feed=%s.value.feeds[%s.value.currentFeedIndex];console.log('before GotoPrevFeed',%s,feed);WXU.emit(WXU.Events.GotoPrevFeed,feed);}", flowTabVar, flowTabVar, flowTabVar, flowTabVar, flowTabVar, flowTabVar)
-		content = goToPrevFlowReg.ReplaceAllString(content, jsGoPrevFeed)
-	} else {
-		utils.LogInfo("[Home数据采集] ❌ 在connect.publish中未找到 goToPrevFlowFeed 函数定义")
-	}
+	utils.LogFileInfo("[Home数据采集] ✅ 正在处理 connect.publish 文件")
+	utils.LogFileInfo("[Home数据采集] ⏭️ 跳过 goToNextFlowFeed/goToPrevFlowFeed 重写，避免干扰新版 Home 状态机")
 
 	// 禁用浏览器缓存，确保每次都能拦截到最新的代码
 	Conn.Response.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -1395,2088 +1483,6 @@ func (h *ScriptHandler) handleConnectPublish(Conn *SunnyNet.HttpConn, path strin
 	return content, true
 }
 
-// getCommentCaptureScript 获取评论采集脚本
-func (h *ScriptHandler) getCommentCaptureScript() string {
-	return `<script>
-(function() {
-	'use strict';
-	
-	console.log('[评论采集] 初始化评论采集系统...');
-	
-	// 保存评论数据的函数
-	function saveCommentData(comments, options) {
-		if (!comments || comments.length === 0) {
-			console.log('[评论采集] 没有评论数据，跳过保存');
-			return;
-		}
-		
-		options = options || {};
-		
-		// 去重处理：移除重复的二级回复
-		var deduplicatedComments = [];
-		var totalLevel2Before = 0;
-		var totalLevel2After = 0;
-		
-		for (var i = 0; i < comments.length; i++) {
-			var comment = JSON.parse(JSON.stringify(comments[i])); // 深拷贝
-			
-			if (comment.levelTwoComment && Array.isArray(comment.levelTwoComment)) {
-				totalLevel2Before += comment.levelTwoComment.length;
-				
-				// 使用commentId去重
-				var seenIds = {};
-				var uniqueReplies = [];
-				
-				for (var j = 0; j < comment.levelTwoComment.length; j++) {
-					var reply = comment.levelTwoComment[j];
-					var replyId = reply.commentId;
-					
-					if (!seenIds[replyId]) {
-						seenIds[replyId] = true;
-						uniqueReplies.push(reply);
-					}
-				}
-				
-				comment.levelTwoComment = uniqueReplies;
-				totalLevel2After += uniqueReplies.length;
-			}
-			
-			deduplicatedComments.push(comment);
-		}
-		
-		// 如果有重复，输出日志
-		if (totalLevel2Before > totalLevel2After) {
-			console.log('[评论采集] 🔧 去重: 二级回复从 ' + totalLevel2Before + ' 条减少到 ' + totalLevel2After + ' 条 (移除 ' + (totalLevel2Before - totalLevel2After) + ' 条重复)');
-		}
-		
-		// 计算实际总评论数（一级 + 二级）
-		var actualTotalComments = deduplicatedComments.length + totalLevel2After;
-		
-		// 获取视频信息
-		var videoId = '';
-		var videoTitle = '';
-		
-		// 尝试从当前profile获取视频信息
-		if (window.__wx_channels_store__ && window.__wx_channels_store__.profile) {
-			var profile = window.__wx_channels_store__.profile;
-			videoId = profile.id || profile.nonce_id || '';
-			videoTitle = profile.title || '';
-		}
-		
-		// 如果没有从store获取到，尝试从options获取
-		if (!videoId && options.videoId) {
-			videoId = options.videoId;
-		}
-		if (!videoTitle && options.videoTitle) {
-			videoTitle = options.videoTitle;
-		}
-		
-		console.log('[评论采集] 准备保存评论数据:', {
-			videoId: videoId,
-			videoTitle: videoTitle,
-			commentCount: actualTotalComments,
-			level1Count: deduplicatedComments.length,
-			level2Count: totalLevel2After,
-			source: options.source || 'unknown'
-		});
-		
-		// 获取原始评论数（从视频信息中）
-		var originalCommentCount = 0;
-		if (options.totalCount) {
-			originalCommentCount = options.totalCount;
-		} else if (window.__wx_channels_store__ && window.__wx_channels_store__.profile) {
-			originalCommentCount = window.__wx_channels_store__.profile.commentCount || 0;
-		}
-		
-		// 发送评论数据到后端保存（使用去重后的数据）
-		fetch('/__wx_channels_api/save_comment_data', {
-			method: 'POST',
-			headers: {'Content-Type': 'application/json'},
-			body: JSON.stringify({
-				comments: deduplicatedComments,
-				videoId: videoId,
-				videoTitle: videoTitle,
-				originalCommentCount: originalCommentCount,
-				timestamp: Date.now()
-			})
-		}).then(function(response) {
-			if (response.ok) {
-				console.log('[评论采集] ✓ 评论数据已保存到后端');
-				
-				// 保存成功后返回页面顶部（如果options中指定）
-				if (options.scrollToTop !== false) {
-					console.log('[评论采集] 📤 返回页面顶部');
-					setTimeout(function() {
-						// 使用与向下滚动相同的方法：找到第一个评论并滚动到它
-						try {
-							// 使用与 scrollToLastComment 相同的选择器
-							var commentSelectors = [
-								'[class*="comment-item"]',
-								'[class*="CommentItem"]',
-								'[class*="comment"]',
-								'[class*="Comment"]'
-							];
-							
-							var firstComment = null;
-							var comments = null;
-							
-							// 尝试所有选择器找到评论
-							for (var i = 0; i < commentSelectors.length; i++) {
-								comments = document.querySelectorAll(commentSelectors[i]);
-								if (comments.length > 0) {
-									firstComment = comments[0];
-									console.log('[评论采集] ✓ 找到', comments.length, '个评论，滚动到第一个');
-									break;
-								}
-							}
-							
-							if (firstComment) {
-								// 使用 scrollIntoView 滚动到第一个评论（与向下滚动相同的方法）
-								console.log('[评论采集] ✓ 找到评论，使用 scrollIntoView 滚动到顶部');
-								try {
-									firstComment.scrollIntoView({ behavior: 'smooth', block: 'start' });
-								} catch (e) {
-									firstComment.scrollIntoView(true);
-								}
-							} else {
-								// 如果找不到评论，使用标准方式
-								console.log('[评论采集] ⚠️ 未找到评论元素，使用标准方式滚动');
-								window.scrollTo({ top: 0, behavior: 'smooth' });
-							}
-							
-							console.log('[评论采集] ✓ 已执行返回顶部操作');
-						} catch (e) {
-							console.error('[评论采集] 返回顶部失败:', e);
-						}
-					}, 1000);
-				}
-			} else {
-				console.error('[评论采集] ✗ 保存评论数据失败:', response.status);
-			}
-		}).catch(function(error) {
-			console.error('[评论采集] ✗ 保存评论数据出错:', error);
-		});
-	}
-	
-	// 将保存函数暴露到全局，供其他脚本使用
-	window.__wx_channels_save_comment_data = saveCommentData;
-	
-	// 监控评论数据的变化
-	var lastCommentSignature = '';
-	var commentCheckInterval = null;
-	var storeCheckAttempts = 0;
-	var maxStoreCheckAttempts = 20; // 最多尝试20次（60秒）
-	var isLoadingAllComments = false; // 标记是否正在加载全部评论
-	var lastCommentCount = 0; // 记录上次的评论数量
-	var pendingSaveTimer = null; // 延迟保存定时器
-	var stableCheckCount = 0; // 稳定检查计数
-	var autoScrollEnabled = false; // 是否启用自动滚动
-	var autoScrollInterval = null; // 自动滚动定时器
-	var noChangeCount = 0; // 评论数量未变化的次数
-	
-	function getCommentSignature(comments) {
-		if (!comments || comments.length === 0) return '';
-		// 使用评论数量和第一条、最后一条评论的ID生成签名
-		var firstId = comments[0].id || comments[0].commentId || '';
-		var lastId = comments[comments.length - 1].id || comments[comments.length - 1].commentId || '';
-		return comments.length + '_' + firstId + '_' + lastId;
-	}
-	
-	// 获取详细的评论统计信息
-	function getCommentStats() {
-		try {
-			var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-			for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-				var el = rootElements[i];
-				var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-				if (vueInstance) {
-					var componentInstance = vueInstance.component || vueInstance;
-					if (componentInstance) {
-						var appContext = componentInstance.appContext || 
-						                 (componentInstance.ctx && componentInstance.ctx.appContext);
-						
-						if (appContext && appContext.config && appContext.config.globalProperties) {
-							if (appContext.config.globalProperties.$pinia) {
-								var pinia = appContext.config.globalProperties.$pinia;
-								var feedStore = null;
-								
-								if (pinia._s && pinia._s.feed) {
-									feedStore = pinia._s.feed;
-								} else if (pinia._s && pinia._s.get && typeof pinia._s.get === 'function') {
-									feedStore = pinia._s.get('feed');
-								} else if (pinia.state && pinia.state._value && pinia.state._value.feed) {
-									feedStore = pinia.state._value.feed;
-								}
-								
-								if (feedStore) {
-									var commentList = feedStore.commentList || (feedStore.feed && feedStore.feed.commentList);
-									if (commentList && commentList.dataList && commentList.dataList.items) {
-										var items = commentList.dataList.items;
-										var level1Count = items.length; // 一级评论数量
-										var level2Count = 0; // 二级回复数量
-										
-										// 统计二级回复数量
-										for (var j = 0; j < items.length; j++) {
-											var item = items[j];
-											if (item.levelTwoComment && Array.isArray(item.levelTwoComment)) {
-												level2Count += item.levelTwoComment.length;
-											}
-										}
-										
-										return {
-											level1: level1Count,
-											level2: level2Count,
-											total: level1Count + level2Count
-										};
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		} catch (e) {
-			// 静默失败
-		}
-		return { level1: 0, level2: 0, total: 0 };
-	}
-	
-	// 获取当前评论数量（包括一级评论和二级回复）
-	function getCurrentCommentCount() {
-		try {
-			var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-			for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-				var el = rootElements[i];
-				var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-				if (vueInstance) {
-					var componentInstance = vueInstance.component || vueInstance;
-					if (componentInstance) {
-						var appContext = componentInstance.appContext || 
-						                 (componentInstance.ctx && componentInstance.ctx.appContext);
-						
-						if (appContext && appContext.config && appContext.config.globalProperties) {
-							if (appContext.config.globalProperties.$pinia) {
-								var pinia = appContext.config.globalProperties.$pinia;
-								var feedStore = null;
-								
-								if (pinia._s && pinia._s.feed) {
-									feedStore = pinia._s.feed;
-								} else if (pinia._s && pinia._s.get && typeof pinia._s.get === 'function') {
-									feedStore = pinia._s.get('feed');
-								} else if (pinia.state && pinia.state._value && pinia.state._value.feed) {
-									feedStore = pinia.state._value.feed;
-								}
-								
-								if (feedStore) {
-									var commentList = feedStore.commentList || (feedStore.feed && feedStore.feed.commentList);
-									if (commentList && commentList.dataList && commentList.dataList.items) {
-										var items = commentList.dataList.items;
-										var totalCount = items.length; // 一级评论数量
-										
-										// 统计二级回复数量
-										for (var j = 0; j < items.length; j++) {
-											var item = items[j];
-											// 检查是否有二级回复
-											if (item.levelTwoComment && Array.isArray(item.levelTwoComment)) {
-												totalCount += item.levelTwoComment.length;
-											}
-										}
-										
-										return totalCount;
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		} catch (e) {
-			// 静默失败
-		}
-		return 0;
-	}
-	
-	// 验证二级评论完整性：检查实际采集的二级评论数量是否与expandCommentCount一致
-	function verifySecondaryCommentCompleteness() {
-		try {
-			var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-			for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-				var el = rootElements[i];
-				var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-				if (vueInstance) {
-					var componentInstance = vueInstance.component || vueInstance;
-					if (componentInstance) {
-						var appContext = componentInstance.appContext || 
-						                 (componentInstance.ctx && componentInstance.ctx.appContext);
-						
-						if (appContext && appContext.config && appContext.config.globalProperties) {
-							if (appContext.config.globalProperties.$pinia) {
-								var pinia = appContext.config.globalProperties.$pinia;
-								var feedStore = null;
-								
-								if (pinia._s && pinia._s.feed) {
-									feedStore = pinia._s.feed;
-								} else if (pinia._s && pinia._s.get && typeof pinia._s.get === 'function') {
-									feedStore = pinia._s.get('feed');
-								} else if (pinia.state && pinia.state._value && pinia.state._value.feed) {
-									feedStore = pinia.state._value.feed;
-								}
-								
-								if (feedStore) {
-									var commentList = feedStore.commentList || (feedStore.feed && feedStore.feed.commentList);
-									if (commentList && commentList.dataList && commentList.dataList.items) {
-										var items = commentList.dataList.items;
-										var totalExpected = 0; // 预期的二级评论总数
-										var totalActual = 0;   // 实际采集的二级评论总数
-										var incompleteComments = []; // 不完整的评论列表
-										
-										// 检查每条一级评论
-										for (var j = 0; j < items.length; j++) {
-											var item = items[j];
-											var expected = item.expandCommentCount || 0;
-											var actual = (item.levelTwoComment && Array.isArray(item.levelTwoComment)) ? item.levelTwoComment.length : 0;
-											
-											totalExpected += expected;
-											totalActual += actual;
-											
-											// 如果实际数量少于预期数量，记录下来
-											if (expected > 0 && actual < expected) {
-												incompleteComments.push({
-													commentId: item.commentId,
-													content: (item.content || '').substring(0, 30),
-													expected: expected,
-													actual: actual,
-													missing: expected - actual
-												});
-											}
-										}
-										
-										return {
-											totalExpected: totalExpected,
-											totalActual: totalActual,
-											incompleteComments: incompleteComments,
-											isComplete: totalExpected === totalActual,
-											completeness: totalExpected > 0 ? (totalActual / totalExpected * 100).toFixed(1) : 100
-										};
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		} catch (e) {
-			console.error('[二级评论验证] 验证失败:', e);
-		}
-		return {
-			totalExpected: 0,
-			totalActual: 0,
-			incompleteComments: [],
-			isComplete: true,
-			completeness: 100
-		};
-	}
-	
-	// 查找评论滚动容器
-	function findCommentScrollContainer() {
-		var scrollableContainers = [];
-		
-		// 查找所有可滚动的元素
-		function findScrollableElements(element, depth) {
-			if (!element || depth > 10) {
-				return;
-			}
-			
-			// 跳过 body 和 html，稍后单独处理
-			if (element === document.body || element === document.documentElement) {
-				return;
-			}
-			
-			var style = window.getComputedStyle(element);
-			var overflowY = style.overflowY || style.overflow;
-			var hasScrollStyle = (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay');
-			var hasScroll = hasScrollStyle && element.scrollHeight > element.clientHeight + 5; // 5px容差
-			
-			if (hasScroll) {
-				// 检查是否包含评论项
-				var commentItems = element.querySelectorAll('[class*="comment"], [class*="Comment"]');
-				if (commentItems.length > 1) {
-					var scrollableHeight = element.scrollHeight - element.clientHeight;
-					scrollableContainers.push({
-						element: element,
-						commentCount: commentItems.length,
-						scrollHeight: element.scrollHeight,
-						clientHeight: element.clientHeight,
-						scrollableHeight: scrollableHeight,
-						className: element.className || '',
-						id: element.id || ''
-					});
-					console.log('[评论采集] 发现可滚动容器:', element.tagName, element.className || element.id || '', 
-					           '评论数:', commentItems.length, 
-					           '可滚动高度:', scrollableHeight + 'px');
-				}
-			}
-			
-			// 递归查找子元素
-			for (var i = 0; i < element.children.length; i++) {
-				findScrollableElements(element.children[i], depth + 1);
-			}
-		}
-		
-		// 从 body 开始查找
-		findScrollableElements(document.body, 0);
-		
-		// 如果找到可滚动的容器，选择可滚动高度最大且包含评论的
-		if (scrollableContainers.length > 0) {
-			// 优先选择可滚动高度最大的容器
-			scrollableContainers.sort(function(a, b) {
-				// 首先按可滚动高度排序
-				if (Math.abs(a.scrollableHeight - b.scrollableHeight) > 100) {
-					return b.scrollableHeight - a.scrollableHeight;
-				}
-				// 如果可滚动高度相近，按评论数量排序
-				return b.commentCount - a.commentCount;
-			});
-			
-			var bestContainer = scrollableContainers[0].element;
-			console.log('[评论采集] ✓ 选择最佳滚动容器:', bestContainer.tagName, 
-			           bestContainer.className || bestContainer.id || '', 
-			           '包含', scrollableContainers[0].commentCount, '个评论项',
-			           '可滚动高度:', scrollableContainers[0].scrollableHeight + 'px');
-			return bestContainer;
-		}
-		
-		// 检查页面本身是否可滚动
-		var bodyScrollHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-		var viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-		if (bodyScrollHeight > viewportHeight + 5) {
-			console.log('[评论采集] 使用页面滚动 (window/body), 可滚动高度:', (bodyScrollHeight - viewportHeight) + 'px');
-			return document.body;
-		}
-		
-		// 如果都不可滚动，仍然返回body，但给出警告
-		console.warn('[评论采集] ⚠️ 未找到可滚动容器，使用body作为默认容器');
-		return document.body;
-	}
-	
-	// 强制滚动到容器底部（不使用 smooth，立即执行）
-	function scrollToBottom(container) {
-		if (!container) return;
-		
-		// 如果是 body 或 html，使用 window.scrollTo
-		if (container === document.body || container === document.documentElement) {
-			// 获取页面最大滚动高度
-			var maxScroll = Math.max(
-				document.body.scrollHeight,
-				document.documentElement.scrollHeight,
-				document.body.offsetHeight,
-				document.documentElement.offsetHeight
-			);
-			
-			// 立即滚动（不使用 smooth）
-			window.scrollTo(0, maxScroll);
-			document.documentElement.scrollTop = maxScroll;
-			document.body.scrollTop = maxScroll;
-			
-			// 多次尝试确保滚动成功
-			setTimeout(function() {
-				window.scrollTo(0, maxScroll);
-				document.documentElement.scrollTop = maxScroll;
-				document.body.scrollTop = maxScroll;
-			}, 50);
-			
-			setTimeout(function() {
-				window.scrollTo(0, maxScroll);
-				document.documentElement.scrollTop = maxScroll;
-				document.body.scrollTop = maxScroll;
-			}, 200);
-		} else {
-			// 滚动容器本身
-			var maxScroll = container.scrollHeight - container.clientHeight;
-			container.scrollTop = maxScroll;
-			
-			// 多次尝试确保滚动成功
-			setTimeout(function() {
-				container.scrollTop = maxScroll;
-			}, 50);
-			
-			setTimeout(function() {
-				container.scrollTop = maxScroll;
-			}, 200);
-		}
-	}
-	
-	// 缓存评论选择器，避免重复查询
-	var cachedCommentSelector = null;
-	var lastCommentElementCount = 0; // 记录上次找到的评论元素数量
-	
-	// 尝试找到评论列表的最后一个元素并滚动到它（优化版）
-	function scrollToLastComment() {
-		// 尝试多种选择器找到评论项
-		var commentSelectors = [
-			'[class*="comment-item"]',
-			'[class*="CommentItem"]',
-			'[class*="comment"]',
-			'[class*="Comment"]'
-		];
-		
-		var lastComment = null;
-		var comments = null;
-		var selector = null;
-		
-		// 如果之前找到过选择器，优先使用缓存的选择器
-		if (cachedCommentSelector) {
-			comments = document.querySelectorAll(cachedCommentSelector);
-			if (comments.length > 0) {
-				selector = cachedCommentSelector;
-			}
-		}
-		
-		// 如果缓存的选择器无效，尝试所有选择器
-		if (!comments || comments.length === 0) {
-			for (var i = 0; i < commentSelectors.length; i++) {
-				comments = document.querySelectorAll(commentSelectors[i]);
-				if (comments.length > 0) {
-					selector = commentSelectors[i];
-					cachedCommentSelector = selector; // 缓存有效的选择器
-					break;
-				}
-			}
-		}
-		
-		if (comments && comments.length > 0) {
-			lastComment = comments[comments.length - 1];
-			
-			// 只在评论数量变化时输出日志（减少日志量）
-			if (comments.length !== lastCommentElementCount) {
-				console.log('[评论采集] 找到评论项:', comments.length, '个，滚动到最后一个');
-				lastCommentElementCount = comments.length;
-			}
-			
-			// 检查最后一个评论是否已经在视口内（避免不必要的滚动）
-			var rect = lastComment.getBoundingClientRect();
-			var viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-			var isVisible = rect.top >= 0 && rect.top < viewportHeight;
-			
-			// 如果最后一个评论已经在视口内，滚动到稍微下面一点以触发加载
-			if (isVisible) {
-				// 滚动到稍微下面一点，确保触发加载更多（增加滚动距离）
-				var scrollY = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop;
-				var targetScroll = scrollY + rect.bottom + 500; // 增加滚动距离到500px，确保触发加载
-				
-				// 多次尝试滚动，确保生效
-				window.scrollTo(0, targetScroll);
-				document.documentElement.scrollTop = targetScroll;
-				document.body.scrollTop = targetScroll;
-				
-				// 延迟再次滚动，确保生效
-				setTimeout(function() {
-					window.scrollTo(0, targetScroll);
-					document.documentElement.scrollTop = targetScroll;
-					document.body.scrollTop = targetScroll;
-				}, 100);
-			} else {
-				// 如果不在视口内，使用 scrollIntoView 滚动到它
-				try {
-					lastComment.scrollIntoView({ behavior: 'auto', block: 'end' });
-				} catch (e) {
-					// 如果不支持参数，使用默认方式
-					lastComment.scrollIntoView(false);
-				}
-				
-				// 滚动后再稍微向下滚动一点，确保触发加载（增加滚动距离）
-				setTimeout(function() {
-					var rect2 = lastComment.getBoundingClientRect();
-					var scrollY2 = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop;
-					var targetScroll2 = scrollY2 + rect2.bottom + 500; // 增加滚动距离到500px
-					
-					// 多次尝试滚动，确保生效
-					window.scrollTo(0, targetScroll2);
-					document.documentElement.scrollTop = targetScroll2;
-					document.body.scrollTop = targetScroll2;
-					
-					// 再次延迟滚动
-					setTimeout(function() {
-						window.scrollTo(0, targetScroll2);
-						document.documentElement.scrollTop = targetScroll2;
-						document.body.scrollTop = targetScroll2;
-					}, 100);
-				}, 100);
-			}
-			
-			return true;
-		}
-		
-		// 如果找不到评论，清除缓存
-		cachedCommentSelector = null;
-		lastCommentElementCount = 0;
-		
-		return false;
-	}
-	
-	// 尝试直接调用 Vue Store 的加载更多方法
-	function tryLoadMoreComments() {
-		try {
-			var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-			for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-				var el = rootElements[i];
-				var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-				if (vueInstance) {
-					var componentInstance = vueInstance.component || vueInstance;
-					if (componentInstance) {
-						var appContext = componentInstance.appContext || 
-						                 (componentInstance.ctx && componentInstance.ctx.appContext);
-						
-						if (appContext && appContext.config && appContext.config.globalProperties) {
-							if (appContext.config.globalProperties.$pinia) {
-								var pinia = appContext.config.globalProperties.$pinia;
-								var feedStore = null;
-								
-								if (pinia._s && pinia._s.feed) {
-									feedStore = pinia._s.feed;
-								} else if (pinia._s && pinia._s.get && typeof pinia._s.get === 'function') {
-									feedStore = pinia._s.get('feed');
-								} else if (pinia.state && pinia.state._value && pinia.state._value.feed) {
-									feedStore = pinia.state._value.feed;
-								}
-								
-								if (feedStore) {
-									var commentList = feedStore.commentList || (feedStore.feed && feedStore.feed.commentList);
-									if (commentList) {
-										// 尝试调用加载更多的方法
-										var methods = ['loadMore', 'loadMoreComments', 'fetchMore', 'getMore', 'loadNextPage', 'nextPage'];
-										for (var j = 0; j < methods.length; j++) {
-											if (typeof commentList[methods[j]] === 'function') {
-												console.log('[评论采集] 尝试调用方法:', methods[j]);
-												try {
-													commentList[methods[j]]();
-													return true;
-												} catch (e) {
-													console.log('[评论采集] 调用方法失败:', methods[j], e.message);
-												}
-											}
-										}
-										
-										// 尝试调用 feedStore 的方法
-										for (var j = 0; j < methods.length; j++) {
-											if (typeof feedStore[methods[j]] === 'function') {
-												console.log('[评论采集] 尝试调用 feedStore 方法:', methods[j]);
-												try {
-													feedStore[methods[j]]();
-													return true;
-												} catch (e) {
-													console.log('[评论采集] 调用 feedStore 方法失败:', methods[j], e.message);
-												}
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		} catch (e) {
-			console.log('[评论采集] 尝试调用加载方法失败:', e.message);
-		}
-		
-		return false;
-	}
-	
-	// 自动加载所有评论 - 通过滚动触发加载
-	function startAutoScroll(totalCount) {
-		if (autoScrollEnabled) {
-			console.log('[评论采集] 自动加载已在运行中');
-			return;
-		}
-		
-		autoScrollEnabled = true;
-		noChangeCount = 0;
-		var loadAttempts = 0;
-		var maxLoadAttempts = 200; // 最多尝试200次（约10分钟）
-		var lastCount = getCurrentCommentCount();
-		lastCommentCount = lastCount;
-		
-		// 初始化时输出当前状态
-		if (lastCount > 0) {
-			console.log('[评论采集] 初始评论数: ' + lastCount);
-		}
-		
-		console.log('[评论采集] 🚀 开始自动滚动加载评论');
-		var initialStats = getCommentStats();
-		console.log('[评论采集] 当前评论数: ' + lastCount + ' (一级:' + initialStats.level1 + ' + 二级:' + initialStats.level2 + ')');
-		if (totalCount > 0) {
-			console.log('[评论采集] 目标评论数: ' + totalCount);
-		}
-		
-		// 查找评论滚动容器
-		var scrollContainer = findCommentScrollContainer();
-		
-		// 检查容器是否可滚动
-		var canScroll = false;
-		var scrollableHeight = 0;
-		if (scrollContainer === document.body || scrollContainer === document.documentElement) {
-			var maxScroll = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-			var viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-			scrollableHeight = maxScroll - viewportHeight;
-			canScroll = scrollableHeight > 5;
-			console.log('[评论采集] 页面滚动检查: 总高度=' + maxScroll + 'px, 视口=' + viewportHeight + 'px, 可滚动=' + scrollableHeight + 'px');
-		} else {
-			scrollableHeight = scrollContainer.scrollHeight - scrollContainer.clientHeight;
-			canScroll = scrollableHeight > 5;
-			console.log('[评论采集] 容器滚动检查: 总高度=' + scrollContainer.scrollHeight + 'px, 可见=' + scrollContainer.clientHeight + 'px, 可滚动=' + scrollableHeight + 'px');
-		}
-		
-		if (!canScroll) {
-			console.warn('[评论采集] ⚠️ 警告: 容器不可滚动（可滚动高度=' + scrollableHeight + 'px），可能无法加载更多评论');
-			console.warn('[评论采集] ⚠️ 尝试使用替代方法加载评论...');
-			
-			// 如果容器不可滚动，尝试直接调用加载方法
-			var loadSuccess = tryLoadMoreComments();
-			if (!loadSuccess) {
-				// 如果调用失败，尝试模拟用户交互
-				console.log('[评论采集] 尝试模拟用户交互触发加载...');
-				
-				// 多次尝试点击按钮，因为点击后可能会出现新的按钮
-				var totalClicked = 0;
-				for (var attempt = 0; attempt < 3; attempt++) {
-					var clicked = clickAllLoadMoreButtons();
-					if (clicked) {
-						totalClicked++;
-						// 等待一小段时间让DOM更新（使用同步延迟）
-						var start = Date.now();
-						while (Date.now() - start < 500) {
-							// 等待500ms
-						}
-					} else {
-						break; // 没有找到按钮，停止尝试
-					}
-				}
-				
-				if (totalClicked > 0) {
-					console.log('[评论采集] 完成', totalClicked, '轮按钮点击');
-				}
-			}
-		}
-		
-		// 查找并点击所有"加载更多"按钮
-		function clickAllLoadMoreButtons() {
-			var clickedCount = 0;
-			var clickedButtons = []; // 记录已点击的按钮，避免重复点击
-			
-			// 查找各种可能的"加载更多"按钮
-			var selectors = [
-				'[class*="load-more"]',
-				'[class*="LoadMore"]',
-				'[class*="more-comment"]',
-				'[class*="MoreComment"]',
-				'[class*="展开"]',
-				'[class*="expand"]',
-				'[class*="Expand"]',
-				'[class*="reply"]',
-				'[class*="Reply"]',
-				'button',
-				'div[role="button"]',
-				'span[role="button"]',
-				'a'
-			];
-			
-			for (var s = 0; s < selectors.length; s++) {
-				var buttons = document.querySelectorAll(selectors[s]);
-				for (var i = 0; i < buttons.length; i++) {
-					var btn = buttons[i];
-					
-					// 避免重复点击
-					if (clickedButtons.indexOf(btn) !== -1) {
-						continue;
-					}
-					
-					var btnText = (btn.textContent || btn.innerText || '').trim();
-					
-					// 检查按钮文本是否包含加载更多的关键词
-					if (btnText && (
-						btnText.includes('更多') || 
-						btnText.includes('展开') || 
-						btnText.includes('加载') ||
-						btnText.includes('回复') ||
-						btnText.includes('条回复') ||
-						btnText.toLowerCase().includes('more') || 
-						btnText.toLowerCase().includes('load') ||
-						btnText.toLowerCase().includes('expand') ||
-						btnText.toLowerCase().includes('show') ||
-						btnText.toLowerCase().includes('reply') ||
-						btnText.toLowerCase().includes('replies')
-					)) {
-						// 检查按钮是否可见
-						var rect = btn.getBoundingClientRect();
-						var isVisible = rect.width > 0 && rect.height > 0;
-						
-						if (isVisible) {
-							console.log('[评论采集] 找到加载按钮:', btnText.substring(0, 50));
-							try {
-								btn.click();
-								clickedButtons.push(btn);
-								clickedCount++;
-								console.log('[评论采集] ✓ 已点击按钮');
-								
-								// 点击后等待一小段时间，让DOM更新
-								// 注意：这里不能用setTimeout，因为函数是同步的
-							} catch (e) {
-								console.log('[评论采集] 点击按钮失败:', e.message);
-							}
-						}
-					}
-				}
-			}
-			
-			if (clickedCount > 0) {
-				console.log('[评论采集] 共点击了', clickedCount, '个加载按钮');
-			} else {
-				console.log('[评论采集] 未找到可点击的加载按钮');
-			}
-			
-			return clickedCount > 0;
-		}
-		
-		// 展开所有二级评论（回复）的函数
-		function expandAllSecondaryComments() {
-			var expandedCount = 0;
-			var totalAttempts = 0;
-			
-			// 1. 找到所有一级评论容器
-			var commentSelectors = [
-				'[class*="comment-item"]',
-				'[class*="CommentItem"]',
-				'[class*="comment-card"]',
-				'[class*="CommentCard"]',
-				'[class*="comment"]',
-				'[class*="Comment"]'
-			];
-			
-			var commentItems = [];
-			for (var i = 0; i < commentSelectors.length; i++) {
-				var items = document.querySelectorAll(commentSelectors[i]);
-				if (items.length > 0) {
-					commentItems = Array.from(items);
-					console.log('[二级评论] 使用选择器:', commentSelectors[i], '找到', items.length, '个评论');
-					break;
-				}
-			}
-			
-			if (commentItems.length === 0) {
-				console.log('[二级评论] 未找到评论容器');
-				return 0;
-			}
-			
-			console.log('[二级评论] 开始检查', commentItems.length, '个一级评论的回复按钮');
-			
-			// 调试：输出第一个评论的HTML结构（仅前500字符）
-			if (commentItems.length > 0) {
-				var firstItemHtml = commentItems[0].innerHTML;
-				if (firstItemHtml && firstItemHtml.length > 0) {
-					console.log('[二级评论] 第一个评论的HTML片段:', firstItemHtml.substring(0, 500));
-				}
-			}
-			
-			// 2. 在每个一级评论中查找并点击回复按钮
-			for (var idx = 0; idx < commentItems.length; idx++) {
-				var item = commentItems[idx];
-				
-				// 查找回复按钮的多种可能选择器
-				var replyButtonSelectors = [
-					'[class*="reply-btn"]',
-					'[class*="ReplyBtn"]',
-					'[class*="show-reply"]',
-					'[class*="ShowReply"]',
-					'[class*="view-reply"]',
-					'[class*="ViewReply"]',
-					'[class*="more-reply"]',
-					'[class*="MoreReply"]',
-					'[class*="expand-reply"]',
-					'[class*="ExpandReply"]',
-					'button',
-					'div[role="button"]',
-					'span[role="button"]',
-					'a'
-				];
-				
-				// 调试：记录找到的所有按钮文本（仅第一个评论）
-				if (idx === 0) {
-					var debugButtons = [];
-					for (var ds = 0; ds < replyButtonSelectors.length; ds++) {
-						var debugBtns = item.querySelectorAll(replyButtonSelectors[ds]);
-						for (var db = 0; db < Math.min(debugBtns.length, 5); db++) {
-							var debugText = (debugBtns[db].textContent || debugBtns[db].innerText || '').trim();
-							if (debugText && debugText.length > 0 && debugText.length < 100) {
-								debugButtons.push(debugText);
-							}
-						}
-					}
-					if (debugButtons.length > 0) {
-						console.log('[二级评论] 第一个评论中找到的按钮文本:', debugButtons.slice(0, 10).join(' | '));
-					} else {
-						console.log('[二级评论] 第一个评论中未找到任何按钮');
-					}
-				}
-				
-				for (var s = 0; s < replyButtonSelectors.length; s++) {
-					var buttons = item.querySelectorAll(replyButtonSelectors[s]);
-					
-					for (var b = 0; b < buttons.length; b++) {
-						var btn = buttons[b];
-						var btnText = (btn.textContent || btn.innerText || '').trim();
-						
-						// 检查是否是回复相关按钮（更精确的匹配）
-						var isReplyButton = false;
-						if (btnText) {
-							// 清理文本：移除多余空格和换行符
-							var cleanText = btnText.replace(/\s+/g, ' ').trim();
-							
-							// 匹配"X条回复"、"查看回复"、"展开回复"等
-							if (cleanText.match(/\d+\s*条回复/) ||
-							    cleanText.match(/\d+\s*repl(y|ies)/i) ||
-							    cleanText.includes('条回复') ||
-							    cleanText.includes('查看回复') ||
-							    cleanText.includes('展开回复') ||
-							    cleanText.includes('更多回复') ||
-							    cleanText.includes('显示回复') ||
-							    (cleanText.includes('回复') && cleanText.length < 20) || // 单独的"回复"字样，且文本较短
-							    (cleanText.toLowerCase().includes('view') && cleanText.toLowerCase().includes('repl')) ||
-							    (cleanText.toLowerCase().includes('show') && cleanText.toLowerCase().includes('repl')) ||
-							    (cleanText.toLowerCase().includes('more') && cleanText.toLowerCase().includes('repl')) ||
-							    (cleanText.toLowerCase().includes('expand') && cleanText.toLowerCase().includes('repl'))) {
-								isReplyButton = true;
-							}
-							
-							// 调试：输出未匹配的按钮（仅前3个评论）
-							if (!isReplyButton && idx < 3 && cleanText.length > 0 && cleanText.length < 50) {
-								console.log('[二级评论] 第', idx + 1, '个评论: 未匹配按钮 "' + cleanText + '"');
-							}
-						}
-						
-						if (isReplyButton) {
-							totalAttempts++;
-							
-							// 检查按钮是否可见
-							var rect = btn.getBoundingClientRect();
-							if (rect.width > 0 && rect.height > 0) {
-								try {
-									console.log('[二级评论] 第', idx + 1, '个评论: 点击 "' + btnText.substring(0, 30) + '"');
-									btn.click();
-									expandedCount++;
-								} catch (e) {
-									console.warn('[二级评论] 点击失败:', e.message);
-								}
-							}
-						}
-					}
-				}
-			}
-			
-			if (expandedCount > 0) {
-				console.log('[二级评论] ✓ 展开操作完成: 尝试', totalAttempts, '次, 成功', expandedCount, '次');
-			} else if (totalAttempts > 0) {
-				console.log('[二级评论] ⚠️ 找到', totalAttempts, '个回复按钮但都不可见');
-			}
-			
-			return expandedCount;
-		}
-		
-		// 多轮展开二级评论（异步版本，使用回调）
-		var isExpandingSecondaryComments = false;
-		function expandSecondaryCommentsInRounds(maxRounds, callback) {
-			if (isExpandingSecondaryComments) {
-				console.log('[二级评论] 已有展开任务在运行中');
-				return;
-			}
-			
-			isExpandingSecondaryComments = true;
-			var round = 0;
-			maxRounds = maxRounds || 3;
-			
-			function performRound() {
-				round++;
-				console.log('[二级评论] 🔄 开始第', round, '/', maxRounds, '轮展开...');
-				
-				var expandCount = expandAllSecondaryComments();
-				
-				// 等待DOM更新后继续下一轮
-				setTimeout(function() {
-					// 如果还有按钮被点击，或者还没达到最大轮数，继续下一轮
-					if (round < maxRounds && (expandCount > 0 || round === 1)) {
-						performRound();
-					} else {
-						console.log('[二级评论] ✓ 所有轮次完成 (共', round, '轮)');
-						isExpandingSecondaryComments = false;
-						if (callback) callback();
-					}
-				}, 1500); // 每轮之间等待1.5秒
-			}
-			
-			performRound();
-		}
-		
-		// 增量滚动距离（像素）
-		var scrollStep = 300; // 每次滚动300px（增加初始步长）
-		var lastScrollPosition = 0;
-		var isScrolling = false; // 防止并发滚动
-		var scrollThrottle = 0; // 滚动节流计数器
-		
-		// 增量滚动加载函数（优化版：每次滚动一小段，检查新数据，添加错误处理）
-		function performScrollLoad() {
-			// 防止并发执行
-			if (isScrolling) {
-				return;
-			}
-			
-			try {
-				loadAttempts++;
-				isScrolling = true;
-				
-				// 获取当前滚动位置
-				var currentScrollPos = 0;
-				var maxScroll = 0;
-				try {
-					if (scrollContainer === document.body || scrollContainer === document.documentElement) {
-						currentScrollPos = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop;
-						maxScroll = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-					} else {
-						currentScrollPos = scrollContainer.scrollTop;
-						maxScroll = scrollContainer.scrollHeight;
-					}
-				} catch (e) {
-					console.error('[评论采集] 获取滚动位置失败:', e);
-					isScrolling = false;
-					return;
-				}
-				
-				// 记录当前评论数量（滚动前）
-				var countBeforeScroll = 0;
-				try {
-					countBeforeScroll = getCurrentCommentCount();
-				} catch (e) {
-					console.error('[评论采集] 获取评论数量失败:', e);
-				}
-				
-				// 优先使用滚动到最后一个评论的方法（这是最有效的方法）
-				var scrolledToComment = false;
-				try {
-					// 总是尝试滚动到最后一个评论（这个方法最有效）
-					scrolledToComment = scrollToLastComment();
-					
-					// 如果滚动到评论失败，尝试增量滚动
-					if (!scrolledToComment) {
-						var targetScrollPos = currentScrollPos + scrollStep;
-						if (scrollContainer === document.body || scrollContainer === document.documentElement) {
-							window.scrollTo(0, targetScrollPos);
-							document.documentElement.scrollTop = targetScrollPos;
-							document.body.scrollTop = targetScrollPos;
-						} else {
-							scrollContainer.scrollTop = targetScrollPos;
-						}
-					}
-				} catch (e) {
-					console.error('[评论采集] 滚动操作失败:', e);
-				}
-				
-				// 触发滚动事件（确保监听器被触发）
-				try {
-					var scrollEvent = new Event('scroll', { bubbles: true, cancelable: true });
-					if (scrollContainer === document.body || scrollContainer === document.documentElement) {
-						window.dispatchEvent(scrollEvent);
-						document.dispatchEvent(scrollEvent);
-					} else {
-						scrollContainer.dispatchEvent(scrollEvent);
-					}
-				} catch (e) {
-					console.error('[评论采集] 触发滚动事件失败:', e);
-				}
-				
-				// 验证滚动是否生效（延迟检查）
-				setTimeout(function() {
-					try {
-						var newScrollPos = 0;
-						if (scrollContainer === document.body || scrollContainer === document.documentElement) {
-							newScrollPos = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop;
-						} else {
-							newScrollPos = scrollContainer.scrollTop;
-						}
-						
-						// 如果滚动位置没有变化，说明滚动可能无效，强制使用 scrollToLastComment
-						if (Math.abs(newScrollPos - currentScrollPos) < 10 && loadAttempts > 3) {
-							if (loadAttempts % 5 === 0) {
-								console.log('[评论采集] ⚠️ 滚动位置未变化，强制使用滚动到评论方法');
-							}
-							scrollToLastComment();
-						}
-					} catch (e) {
-						// 忽略错误
-					}
-				}, 100);
-			
-				// 只在第一次和每10次输出日志（减少日志量）
-				if (loadAttempts === 1 || loadAttempts % 10 === 0) {
-					var logTargetPos = scrolledToComment ? '滚动到评论' : (currentScrollPos + scrollStep);
-					console.log('[评论采集] 🔽 增量滚动 (第' + loadAttempts + '次) - 位置: ' + Math.round(currentScrollPos) + ' -> ' + (scrolledToComment ? '滚动到评论' : Math.round(currentScrollPos + scrollStep)));
-				}
-				
-				// 如果容器不可滚动且滚动位置没有变化，快速进入最终检查
-				if (!canScroll && loadAttempts >= 2) {
-					console.log('[评论采集] 容器不可滚动且已尝试' + loadAttempts + '次，快速进入最终检查');
-					noChangeCount = 20; // 直接设置为触发最终检查的阈值
-				}
-				
-				// 滚动后等待一段时间再检查评论数量（给页面时间加载新内容）
-				// 使用多次检查机制，确保捕获到数据变化
-				var checkDelay = 2500; // 增加到2.5秒
-				var recheckDelay = 1500; // 如果第一次没变化，1.5秒后再检查一次
-				
-				setTimeout(function() {
-					try {
-						// 第一次检查：获取当前评论数量（滚动后）
-						var currentCount = 0;
-						try {
-							currentCount = getCurrentCommentCount();
-							lastCommentCount = currentCount;
-						} catch (e) {
-							console.error('[评论采集] 获取评论数量失败:', e);
-							isScrolling = false;
-							return;
-						}
-						
-						// 如果第一次检查发现有新数据，立即处理
-						if (currentCount > countBeforeScroll) {
-							console.log('[评论采集] ✓ 第一次检查发现新数据: ' + countBeforeScroll + ' -> ' + currentCount);
-							handleCountChange(currentCount, countBeforeScroll);
-							return;
-						}
-						
-						// 如果第一次没有新数据，等待后再检查一次（可能数据还在加载中）
-						setTimeout(function() {
-							try {
-								var recheckCount = getCurrentCommentCount();
-								if (recheckCount > currentCount) {
-									console.log('[评论采集] ✓ 第二次检查发现新数据: ' + currentCount + ' -> ' + recheckCount);
-									currentCount = recheckCount;
-									lastCommentCount = recheckCount;
-								}
-								handleCountChange(currentCount, countBeforeScroll);
-							} catch (e) {
-								console.error('[评论采集] 第二次检查失败:', e);
-								handleCountChange(currentCount, countBeforeScroll);
-							}
-						}, recheckDelay);
-						
-					} catch (e) {
-						console.error('[评论采集] 滚动检查失败:', e);
-						isScrolling = false;
-					}
-				}, checkDelay);
-				
-				// 处理评论数量变化的函数
-				function handleCountChange(currentCount, countBeforeScroll) {
-					try {
-				
-						// 检查是否完成（允许1条误差）
-						if (totalCount > 0 && currentCount >= totalCount - 1) {
-							console.log('[评论采集] ✅ 已加载全部评论 (' + currentCount + '/' + totalCount + ')');
-							isScrolling = false;
-							stopAutoScroll(true);
-							return;
-						}
-						
-						// 检查是否超时
-						if (loadAttempts > maxLoadAttempts) {
-							console.log('[评论采集] ⚠️ 达到最大尝试次数 (' + maxLoadAttempts + ')');
-							if (totalCount > 0 && currentCount < totalCount) {
-								console.warn('[评论采集] ⚠️ 未能加载全部评论: ' + currentCount + '/' + totalCount + ' (差' + (totalCount - currentCount) + '条)');
-							}
-							isScrolling = false;
-							stopAutoScroll(true);
-							return;
-						}
-				
-						// 检查是否有新数据（与滚动前比较）
-						var hasNewData = currentCount > countBeforeScroll;
-						
-						// 检查评论数量变化（与上次记录比较）
-						if (currentCount !== lastCount) {
-							noChangeCount = 0;
-							var progress = totalCount > 0 ? Math.round(currentCount / totalCount * 100) : '?';
-							var newComments = currentCount - lastCount;
-							// 获取详细统计信息
-							var stats = getCommentStats();
-							console.log('[评论采集] 📊 进度: ' + currentCount + '/' + (totalCount || '?') + ' (' + progress + '%) - 新增: ' + newComments + ' (一级:' + stats.level1 + ' + 二级:' + stats.level2 + ')');
-							lastCount = currentCount;
-							
-							// 发现新数据，继续滚动（保持当前滚动距离）
-							scrollStep = 200; // 重置为默认值
-						} else {
-							// 没有新数据
-							noChangeCount++;
-							
-							// 如果连续多次无新数据，尝试直接调用加载方法和点击按钮
-							if (noChangeCount === 2 || noChangeCount === 5 || noChangeCount === 8) {
-								console.log('[评论采集] 尝试直接调用加载方法...');
-								tryLoadMoreComments();
-								
-								// 同时尝试点击加载更多按钮
-								console.log('[评论采集] 尝试点击加载更多按钮...');
-								clickAllLoadMoreButtons();
-								
-								// 尝试展开二级评论
-								if (noChangeCount === 5) {
-									console.log('[评论采集] 尝试展开二级评论...');
-									expandAllSecondaryComments();
-								}
-							}
-							
-							// 如果没有新数据，不要急于增加滚动距离，保持稳定
-							// 因为可能是数据还在加载中，而不是需要滚动更多
-							if (noChangeCount > 5 && scrollStep < 500) {
-								scrollStep = Math.min(scrollStep + 50, 500); // 缓慢增加滚动距离
-							}
-							
-							// 如果连续多次无新数据，强制滚动到最后一个评论和底部
-							if (noChangeCount > 3 && noChangeCount % 3 === 0) {
-								console.log('[评论采集] 强制滚动到最后一个评论和底部...');
-								scrollToLastComment();
-								setTimeout(function() {
-									scrollToBottom(scrollContainer);
-								}, 500);
-							}
-							
-							if (loadAttempts % 5 === 0 || loadAttempts <= 3) {
-								// 前3次和每5次输出一次日志
-								var progress = totalCount > 0 ? Math.round(currentCount / totalCount * 100) : '?';
-								var scrollInfo = '';
-								try {
-									if (scrollContainer === document.body || scrollContainer === document.documentElement) {
-										var currentScroll = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop;
-										var maxScroll = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-										scrollInfo = ' | 滚动位置: ' + Math.round(currentScroll) + '/' + maxScroll;
-									} else {
-										scrollInfo = ' | 容器滚动: ' + Math.round(scrollContainer.scrollTop) + '/' + scrollContainer.scrollHeight;
-									}
-								} catch (e) {
-									// 忽略错误
-								}
-								console.log('[评论采集] 📊 进度: ' + currentCount + '/' + (totalCount || '?') + ' (' + progress + '%) - 无新数据，继续滚动 (步长: ' + scrollStep + 'px, 无变化次数: ' + noChangeCount + ')' + scrollInfo);
-							}
-						}
-						
-						// 如果连续20次无变化，进行最终检查（增加阈值，确保完整性）
-						if (noChangeCount >= 20) {
-							// 只在第一次触发时输出日志，避免重复
-							if (noChangeCount === 20) {
-								console.log('[评论采集] ⚠️ 评论数量连续20次无变化，进行最终检查...');
-								console.log('[评论采集] 🔍 正在进行深度检查，确保不遗漏评论...');
-							}
-							
-							// 如果接近总数但还没达到，进行多次延迟检查（降低阈值到60%，更早触发）
-							if (totalCount > 0 && currentCount < totalCount && currentCount >= totalCount * 0.6) {
-								// 只在第一次触发时输出日志
-								if (noChangeCount === 20) {
-									console.log('[评论采集] 接近完成（' + currentCount + '/' + totalCount + '），进行延迟检查...');
-								}
-								
-								// 进行5次延迟检查，每次间隔5秒（增加检查次数和间隔，提高完整度）
-								var finalCheckCount = 0;
-								var maxFinalChecks = 5;
-								
-								function performFinalCheck() {
-									try {
-										finalCheckCount++;
-										
-										// 第一次最终检查时，先展开所有二级评论
-										if (finalCheckCount === 1) {
-											console.log('[评论采集] 🔍 最终检查: 展开所有二级评论...');
-											expandSecondaryCommentsInRounds(3, function() {
-												console.log('[评论采集] ✓ 二级评论展开完成，继续最终检查');
-												// 展开完成后继续滚动检查
-												continueFinalCheck();
-											});
-											return; // 等待展开完成
-										}
-										
-										continueFinalCheck();
-									} catch (e) {
-										console.error('[评论采集] 最终检查失败:', e);
-										isScrolling = false;
-										stopAutoScroll(true);
-									}
-								}
-								
-								function continueFinalCheck() {
-									try {
-										// 每次检查时都尝试多次滚动，确保触发加载
-										scrollToLastComment();
-										
-										// 尝试点击所有加载更多按钮
-										setTimeout(function() {
-											console.log('[评论采集] 最终检查: 尝试点击加载按钮...');
-											clickAllLoadMoreButtons();
-										}, 300);
-										
-										// 额外滚动到底部，确保触发加载
-										setTimeout(function() {
-											scrollToBottom(scrollContainer);
-										}, 600);
-										
-										// 再次滚动到最后一个评论
-										setTimeout(function() {
-											scrollToLastComment();
-										}, 1200);
-										
-										// 等待一段时间后检查评论数量（增加等待时间）
-										setTimeout(function() {
-											var finalCount = getCurrentCommentCount();
-											
-											// 验证二级评论完整性
-											var verification = verifySecondaryCommentCompleteness();
-											if (verification.totalExpected > 0) {
-												console.log('[评论采集] 📊 二级评论验证: ' + verification.totalActual + '/' + verification.totalExpected + ' (' + verification.completeness + '%)');
-												
-												// 如果不完整且还有检查次数，输出详情
-												if (!verification.isComplete && verification.incompleteComments.length > 0 && finalCheckCount < maxFinalChecks) {
-													console.log('[评论采集] ⚠️ 发现 ' + verification.incompleteComments.length + ' 条评论的回复不完整');
-													for (var vi = 0; vi < Math.min(verification.incompleteComments.length, 3); vi++) {
-														var inc = verification.incompleteComments[vi];
-														console.log('[评论采集]   - "' + inc.content + '..." 缺少 ' + inc.missing + ' 条回复 (' + inc.actual + '/' + inc.expected + ')');
-													}
-													
-													// 如果完整度低于90%，再次尝试展开
-													if (parseFloat(verification.completeness) < 90) {
-														console.log('[评论采集] 🔄 二级评论完整度低于90%，再次尝试展开...');
-														expandAllSecondaryComments();
-													}
-												} else if (verification.isComplete) {
-													console.log('[评论采集] ✓ 二级评论完整度验证通过！');
-												}
-											}
-											
-											console.log('[评论采集] 最终检查 ' + finalCheckCount + '/' + maxFinalChecks + ': ' + finalCount + '/' + totalCount);
-											
-											// 如果第一次检查没有变化，再等待一段时间后再次检查
-											if (finalCount === currentCount && finalCheckCount <= maxFinalChecks - 2) {
-												setTimeout(function() {
-													var recheckCount = getCurrentCommentCount();
-													if (recheckCount > finalCount) {
-														console.log('[评论采集] ✓ 延迟检查发现新数据: ' + finalCount + ' -> ' + recheckCount);
-														finalCount = recheckCount;
-													}
-													processFinalCheckResult(finalCount);
-												}, 2000); // 再等待2秒
-												return;
-											}
-											
-											processFinalCheckResult(finalCount);
-										}, 2500); // 增加到2.5秒
-										
-										function processFinalCheckResult(finalCount) {
-											
-											if (finalCount > currentCount) {
-												// 发现新评论，继续加载
-												console.log('[评论采集] ✓ 发现新评论 (' + currentCount + ' -> ' + finalCount + ')，继续加载');
-												noChangeCount = 0;
-												lastCount = finalCount;
-												lastCommentCount = finalCount;
-												currentCount = finalCount; // 更新当前计数
-												
-												// 重新启动滚动加载（定时器应该还在运行，只需要重置标志）
-												autoScrollEnabled = true; // 确保标志为true
-												isScrolling = false; // 释放滚动锁
-												
-												// 立即滚动到最后一个评论，触发加载
-												scrollToLastComment();
-												
-												// 立即执行一次滚动
-												setTimeout(function() {
-													performScrollLoad();
-												}, 1000);
-												return;
-											}
-											
-											if (finalCheckCount < maxFinalChecks) {
-												// 继续检查（增加间隔到5秒，给网络更多时间）
-												console.log('[评论采集] ⏳ 预计还需要 ' + ((maxFinalChecks - finalCheckCount) * 5) + ' 秒完成检查');
-												setTimeout(performFinalCheck, 5000);
-											} else {
-												// 最终确认停止
-												console.log('[评论采集] 最终评论数: ' + finalCount + (totalCount > 0 ? ' / ' + totalCount : ''));
-												
-												// 如果还是没达到总数，给出警告
-												if (totalCount > 0 && finalCount < totalCount) {
-													console.warn('[评论采集] ⚠️ 未能加载全部评论: ' + finalCount + '/' + totalCount + ' (差' + (totalCount - finalCount) + '条)');
-												}
-												
-												isScrolling = false;
-												stopAutoScroll(true);
-											}
-										}
-									} catch (e) {
-										console.error('[评论采集] 最终检查失败:', e);
-										isScrolling = false;
-										stopAutoScroll(true);
-									}
-								}
-								
-								// 延迟5秒后开始最终检查（给予更多时间）
-								setTimeout(performFinalCheck, 5000);
-								isScrolling = false;
-								return;
-							}
-							
-							// 如果不接近总数，直接停止
-							console.log('[评论采集] 最终评论数: ' + currentCount + (totalCount > 0 ? ' / ' + totalCount : ''));
-							isScrolling = false;
-							stopAutoScroll(true);
-							return;
-						}
-						
-						// 释放滚动锁，允许下次滚动
-						isScrolling = false;
-					} catch (e) {
-						console.error('[评论采集] handleCountChange失败:', e);
-						isScrolling = false;
-					}
-				}
-			} catch (e) {
-				console.error('[评论采集] 滚动加载失败:', e);
-				isScrolling = false;
-			}
-		}
-		
-		// 立即执行第一次滚动
-		performScrollLoad();
-		
-		// 设置定时器，每4秒滚动一次（增加间隔，给予更多时间加载数据）
-		// 考虑到每次滚动后会等待2.5秒+1.5秒=4秒来检查数据，所以总周期约8秒
-		autoScrollInterval = setInterval(performScrollLoad, 4000);
-	}
-	
-	// 停止自动加载
-	function stopAutoScroll(scrollToTop) {
-		if (autoScrollInterval) {
-			clearInterval(autoScrollInterval);
-			autoScrollInterval = null;
-		}
-		autoScrollEnabled = false;
-		noChangeCount = 0;
-		
-		if (scrollToTop) {
-			console.log('[评论采集] 📤 返回顶部');
-			window.scrollTo({ top: 0, behavior: 'smooth' });
-			
-			// 加载完成后，进行检查确保获取到所有评论
-			var saveCheckCount = 0;
-			var maxSaveChecks = 2; // 最多检查2次（减少重复检查）
-			var lastSaveCount = 0;
-			
-			function performSaveCheck() {
-				saveCheckCount++;
-				console.log('[评论采集] 保存前检查 ' + saveCheckCount + '/' + maxSaveChecks + '...');
-				
-				// 获取最新的评论数据
-				try {
-					var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-					for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-						var el = rootElements[i];
-						var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-						if (vueInstance) {
-							var componentInstance = vueInstance.component || vueInstance;
-							if (componentInstance) {
-								var appContext = componentInstance.appContext || 
-								                 (componentInstance.ctx && componentInstance.ctx.appContext);
-								
-								if (appContext && appContext.config && appContext.config.globalProperties) {
-									if (appContext.config.globalProperties.$pinia) {
-										var pinia = appContext.config.globalProperties.$pinia;
-										if (pinia.state && pinia.state._value && pinia.state._value.feed) {
-											var feedStore = pinia.state._value.feed;
-											
-											// 安全地访问评论数据
-											var finalComments = null;
-											try {
-												if (feedStore.commentList && feedStore.commentList.dataList && 
-												    feedStore.commentList.dataList.items && 
-												    Array.isArray(feedStore.commentList.dataList.items)) {
-													finalComments = feedStore.commentList.dataList.items;
-												}
-											} catch (accessError) {
-												console.error('[评论采集] 访问评论数据失败:', accessError.message);
-											}
-											
-											if (finalComments && finalComments.length > 0) {
-												var totalCommentCount = 0;
-												if (window.__wx_channels_store__ && window.__wx_channels_store__.profile) {
-													totalCommentCount = window.__wx_channels_store__.profile.commentCount || 0;
-												}
-												
-												// 检查评论数量是否有变化
-												if (finalComments.length > lastSaveCount) {
-													console.log('[评论采集] ✓ 发现新评论: ' + lastSaveCount + ' -> ' + finalComments.length);
-													lastSaveCount = finalComments.length;
-													
-													// 如果还没达到总数，尝试再次滚动到底部触发加载
-													if (totalCommentCount > 0 && finalComments.length < totalCommentCount && saveCheckCount < maxSaveChecks) {
-														console.log('[评论采集] 尝试再次滚动到底部触发加载...');
-														scrollToLastComment();
-														setTimeout(performSaveCheck, 3000); // 等待更长时间
-														return;
-													}
-												} else if (lastSaveCount === 0) {
-													// 第一次检查，记录初始数量
-													lastSaveCount = finalComments.length;
-												}
-												
-												// 最后一次检查或已达到总数，保存评论
-												if (saveCheckCount >= maxSaveChecks || (totalCommentCount > 0 && finalComments.length >= totalCommentCount)) {
-													console.log('[评论采集] ✅ 加载完成，准备保存评论');
-													
-													// 统计实际评论数（包括二级回复）
-													var actualCommentCount = finalComments.length;
-													var level2Count = 0;
-													for (var ci = 0; ci < finalComments.length; ci++) {
-														if (finalComments[ci].levelTwoComment && Array.isArray(finalComments[ci].levelTwoComment)) {
-															level2Count += finalComments[ci].levelTwoComment.length;
-														}
-													}
-													actualCommentCount += level2Count;
-													
-													console.log('[评论采集] 💾 保存最终评论: ' + actualCommentCount + '/' + totalCommentCount + ' (一级:' + finalComments.length + ' + 二级:' + level2Count + ')');
-													
-													saveCommentData(finalComments, {
-														source: 'auto_scroll_complete',
-														totalCount: totalCommentCount,
-														loadedCount: actualCommentCount,
-														isComplete: actualCommentCount >= totalCommentCount
-													});
-													
-													lastCommentSignature = getCommentSignature(finalComments);
-													lastCommentCount = actualCommentCount;
-													
-													// 标记已通过自动滚动保存，停止Store监控
-													isLoadingAllComments = false;
-													if (commentCheckInterval) {
-														clearInterval(commentCheckInterval);
-														commentCheckInterval = null;
-														console.log('[评论采集] ✓ 已停止Store监控（自动滚动已完成保存）');
-													}
-													// 清除待保存的延迟定时器
-													if (pendingSaveTimer) {
-														clearTimeout(pendingSaveTimer);
-														pendingSaveTimer = null;
-														console.log('[评论采集] ✓ 已取消待保存的定时器');
-													}
-													
-													// 保存完成后返回页面顶部
-													console.log('[评论采集] 📤 返回页面顶部');
-													setTimeout(function() {
-														window.scrollTo({ top: 0, behavior: 'smooth' });
-														console.log('[评论采集] ✅ 评论采集完成');
-													}, 500);
-													
-													return;
-												}
-												
-												// 继续检查
-												if (saveCheckCount < maxSaveChecks) {
-													setTimeout(performSaveCheck, 2000);
-												}
-												break;
-											} else {
-												// 无法获取评论数据
-												console.error('[评论采集] 无法获取评论数据，feedStore.commentList 可能不存在');
-												if (saveCheckCount >= maxSaveChecks) {
-													console.log('[评论采集] ⚠️ 已达最大检查次数，放弃保存');
-												} else {
-													setTimeout(performSaveCheck, 2000);
-												}
-												break;
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				} catch (e) {
-					console.error('[评论采集] 保存评论检查失败:', e);
-					console.error('[评论采集] 错误类型:', typeof e);
-					console.error('[评论采集] 错误消息:', e.message || '(无消息)');
-					console.error('[评论采集] 错误堆栈:', e.stack || '(无堆栈)');
-					
-					// 如果出错，尝试直接保存当前已有的评论
-					if (saveCheckCount >= maxSaveChecks) {
-						console.log('[评论采集] ⚠️ 检查失败但已达最大次数，尝试保存当前评论');
-						// 尝试从 lastCommentCount 获取评论数
-						if (lastCommentCount > 0) {
-							console.log('[评论采集] 使用最后已知的评论数:', lastCommentCount);
-						}
-					} else {
-						// 继续重试
-						setTimeout(performSaveCheck, 2000);
-					}
-				}
-			}
-			
-			// 延迟2秒后开始检查
-			setTimeout(performSaveCheck, 2000);
-		}
-	}
-	
-
-	
-	// 深度探测Store结构的辅助函数
-	var deepFindFirstLog = true; // 标记是否是第一次找到
-	function deepFindComments(obj, path, maxDepth, currentDepth) {
-		if (!obj || typeof obj !== 'object' || currentDepth >= maxDepth) return null;
-		
-		// 检查当前对象是否包含评论数组
-		var possibleArrays = ['comments', 'commentList', 'commentData', 'list', 'items', 'data', 'rootCommentList'];
-		for (var i = 0; i < possibleArrays.length; i++) {
-			var key = possibleArrays[i];
-			if (Array.isArray(obj[key]) && obj[key].length > 0) {
-				var firstItem = obj[key][0];
-				// 验证是否是评论数据
-				if (firstItem && typeof firstItem === 'object' && 
-				    (firstItem.content || firstItem.comment || firstItem.text || 
-				     firstItem.nickname || firstItem.userName || firstItem.commentId)) {
-					// 只在第一次找到时输出日志
-					if (deepFindFirstLog) {
-						console.log('[评论采集] 🎯 在路径', path + '.' + key, '找到评论数据:', obj[key].length, '条');
-						deepFindFirstLog = false;
-					}
-					return {data: obj[key], path: path + '.' + key};
-				}
-			}
-		}
-		
-		// 递归搜索子对象
-		try {
-			var keys = Object.keys(obj);
-			for (var i = 0; i < Math.min(keys.length, 30); i++) {
-				var key = keys[i];
-				if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-				try {
-					var result = deepFindComments(obj[key], path + '.' + key, maxDepth, currentDepth + 1);
-					if (result) return result;
-				} catch (e) {}
-			}
-		} catch (e) {}
-		
-		return null;
-	}
-	
-	function startCommentMonitoring() {
-		if (commentCheckInterval) {
-			clearInterval(commentCheckInterval);
-		}
-		
-		console.log('[评论采集] 启动评论监控（仅从Store获取）...');
-		
-		commentCheckInterval = setInterval(function() {
-			storeCheckAttempts++;
-			
-			// 尝试从Store获取评论数据
-			var comments = [];
-			var foundStore = false;
-			var storePath = '';
-			
-			try {
-				// 第一次检查时输出全局对象信息
-				if (storeCheckAttempts === 1) {
-					console.log('[评论采集] 🔍 开始探测Store结构...');
-					console.log('[评论采集] 检查全局对象:');
-					console.log('[评论采集]   - window.__VUE_DEVTOOLS_GLOBAL_HOOK__:', !!window.__VUE_DEVTOOLS_GLOBAL_HOOK__);
-					console.log('[评论采集]   - window.$pinia:', !!window.$pinia);
-					console.log('[评论采集]   - window.__PINIA__:', !!window.__PINIA__);
-					console.log('[评论采集]   - window.$store:', !!window.$store);
-					
-					// 尝试从DOM元素获取Vue实例
-					var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-					console.log('[评论采集]   - 找到可能的根元素:', rootElements.length);
-					
-					if (rootElements.length > 0) {
-						var firstEl = rootElements[0];
-						console.log('[评论采集]   - 第一个根元素的Vue属性:');
-						console.log('[评论采集]     - __vue__:', !!firstEl.__vue__);
-						console.log('[评论采集]     - __vueParentComponent:', !!firstEl.__vueParentComponent);
-						console.log('[评论采集]     - _vnode:', !!firstEl._vnode);
-						console.log('[评论采集]     - __vnode:', !!firstEl.__vnode);
-					}
-				}
-				
-				// 方法1: 从Vue DevTools Hook获取
-				if (window.__VUE_DEVTOOLS_GLOBAL_HOOK__ && window.__VUE_DEVTOOLS_GLOBAL_HOOK__.apps) {
-					var apps = window.__VUE_DEVTOOLS_GLOBAL_HOOK__.apps;
-					
-					if (storeCheckAttempts === 1) {
-						console.log('[评论采集] ✓ 找到Vue DevTools Hook');
-						console.log('[评论采集] ✓ 找到', apps.length, '个Vue应用实例');
-					}
-					
-					for (var i = 0; i < apps.length; i++) {
-						var app = apps[i];
-						if (app && app.config && app.config.globalProperties) {
-							// 检查Pinia
-							if (app.config.globalProperties.$pinia) {
-								var pinia = app.config.globalProperties.$pinia;
-								
-								if (storeCheckAttempts === 1) {
-									console.log('[评论采集] 找到Pinia实例');
-									if (pinia.state && pinia.state._value) {
-										var storeKeys = Object.keys(pinia.state._value);
-										console.log('[评论采集] Pinia stores:', storeKeys.join(', '));
-									}
-								}
-								
-								if (pinia.state && pinia.state._value) {
-									// 遍历所有store
-									for (var storeKey in pinia.state._value) {
-										var store = pinia.state._value[storeKey];
-										
-										// 第一次检查时输出每个store的结构
-										if (storeCheckAttempts === 1 && store) {
-											var storeKeys = Object.keys(store);
-											console.log('[评论采集] Store "' + storeKey + '" 的字段:', storeKeys.slice(0, 10).join(', '));
-										}
-										
-										// 使用深度搜索查找评论
-										if (store) {
-											var result = deepFindComments(store, 'pinia.' + storeKey, 3, 0);
-											if (result) {
-												comments = result.data;
-												storePath = result.path;
-												foundStore = true;
-												console.log('[评论采集] ✓ 从Pinia获取到评论:', comments.length, '条');
-												console.log('[评论采集] ✓ 数据路径:', storePath);
-												break;
-											}
-										}
-									}
-								}
-							}
-							
-							// 检查Vuex
-							if (!foundStore && app.config.globalProperties.$store) {
-								var store = app.config.globalProperties.$store;
-								
-								if (storeCheckAttempts === 1) {
-									console.log('[评论采集] 找到Vuex store');
-									if (store.state) {
-										var stateKeys = Object.keys(store.state);
-										console.log('[评论采集] Vuex state模块:', stateKeys.join(', '));
-									}
-								}
-								
-								if (store.state) {
-									var result = deepFindComments(store.state, 'vuex.state', 3, 0);
-									if (result) {
-										comments = result.data;
-										storePath = result.path;
-										foundStore = true;
-										console.log('[评论采集] ✓ 从Vuex获取到评论:', comments.length, '条');
-										console.log('[评论采集] ✓ 数据路径:', storePath);
-									}
-								}
-							}
-						}
-						
-						if (foundStore) break;
-					}
-				}
-				
-				// 方法2: 直接从window对象查找
-				if (!foundStore && window.$pinia) {
-					if (storeCheckAttempts === 1) {
-						console.log('[评论采集] ✓ 从window.$pinia查找...');
-					}
-					
-					var pinia = window.$pinia;
-					if (pinia.state && pinia.state._value) {
-						for (var storeKey in pinia.state._value) {
-							var store = pinia.state._value[storeKey];
-							if (store) {
-								var result = deepFindComments(store, 'window.$pinia.' + storeKey, 3, 0);
-								if (result) {
-									comments = result.data;
-									storePath = result.path;
-									foundStore = true;
-									console.log('[评论采集] ✓ 从window.$pinia获取到评论:', comments.length, '条');
-									console.log('[评论采集] ✓ 数据路径:', storePath);
-									break;
-								}
-							}
-						}
-					}
-				}
-				
-				// 方法3: 从window.__PINIA__查找
-				if (!foundStore && window.__PINIA__) {
-					if (storeCheckAttempts === 1) {
-						console.log('[评论采集] ✓ 从window.__PINIA__查找...');
-					}
-					
-					var result = deepFindComments(window.__PINIA__, 'window.__PINIA__', 4, 0);
-					if (result) {
-						comments = result.data;
-						storePath = result.path;
-						foundStore = true;
-						console.log('[评论采集] ✓ 从window.__PINIA__获取到评论:', comments.length, '条');
-						console.log('[评论采集] ✓ 数据路径:', storePath);
-					}
-				}
-				
-				// 方法4: 从DOM元素的Vue实例获取
-				if (!foundStore) {
-					if (storeCheckAttempts === 1) {
-						console.log('[评论采集] 尝试从DOM元素获取Vue实例...');
-					}
-					
-					var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-					for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-						var el = rootElements[i];
-						var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-						
-						if (vueInstance) {
-							if (storeCheckAttempts === 1) {
-								console.log('[评论采集] ✓ 找到Vue实例，尝试获取store...');
-							}
-							
-							// 尝试从Vue实例获取store
-							var componentInstance = vueInstance.component || vueInstance;
-							if (componentInstance) {
-								// 检查appContext
-								var appContext = componentInstance.appContext || 
-								                (componentInstance.ctx && componentInstance.ctx.appContext);
-								
-								if (appContext && appContext.config && appContext.config.globalProperties) {
-									if (appContext.config.globalProperties.$pinia) {
-										var pinia = appContext.config.globalProperties.$pinia;
-										if (pinia.state && pinia.state._value) {
-											if (storeCheckAttempts === 1) {
-												var storeKeys = Object.keys(pinia.state._value);
-												console.log('[评论采集] ✓ 从Vue实例找到Pinia stores:', storeKeys.join(', '));
-											}
-											
-											for (var storeKey in pinia.state._value) {
-												var store = pinia.state._value[storeKey];
-												if (store) {
-													var result = deepFindComments(store, 'vue.pinia.' + storeKey, 3, 0);
-													if (result) {
-														comments = result.data;
-														storePath = result.path;
-														foundStore = true;
-														// 只在第一次找到时输出详细信息
-														if (storeCheckAttempts === 1) {
-															console.log('[评论采集] ✓ 从Vue实例的Pinia获取到评论:', comments.length, '条');
-															console.log('[评论采集] ✓ 数据路径:', storePath);
-														}
-														break;
-													}
-												}
-											}
-										}
-									}
-								}
-							}
-						}
-						
-						if (foundStore) break;
-					}
-				}
-			} catch (e) {
-				console.error('[评论采集] ✗ 从store获取评论失败:', e);
-				if (storeCheckAttempts === 1) {
-					console.error('[评论采集] 错误详情:', e.message);
-					console.error('[评论采集] 错误堆栈:', e.stack);
-				}
-			}
-			
-			// 如果找到了评论数据，检查是否有变化
-			if (foundStore && comments.length > 0) {
-				var currentSignature = getCommentSignature(comments);
-				
-				// 获取总评论数（从视频信息中）
-				var totalCommentCount = 0;
-				if (window.__wx_channels_store__ && window.__wx_channels_store__.profile) {
-					totalCommentCount = window.__wx_channels_store__.profile.commentCount || 0;
-				}
-				
-				if (currentSignature !== lastCommentSignature) {
-					// 检测到变化，重置稳定计数
-					stableCheckCount = 0;
-					
-					console.log('[评论采集] ✓ 检测到评论数据变化');
-					console.log('[评论采集]   - 之前签名:', lastCommentSignature || '(无)');
-					console.log('[评论采集]   - 当前签名:', currentSignature);
-					console.log('[评论采集]   - 当前评论数:', comments.length);
-					if (totalCommentCount > 0) {
-						console.log('[评论采集]   - 总评论数:', totalCommentCount);
-						console.log('[评论采集]   - 完成度:', (comments.length / totalCommentCount * 100).toFixed(1) + '%');
-					}
-					console.log('[评论采集]   - 示例评论:', JSON.stringify(comments[0]).substring(0, 100) + '...');
-					
-					lastCommentSignature = currentSignature;
-					lastCommentCount = comments.length;
-					
-					// 第一次找到评论时，先启动自动滚动
-					if (storeCheckAttempts === 1) {
-						if (totalCommentCount > 0 && comments.length < totalCommentCount) {
-							console.log('[评论采集] 💡 评论未完全加载: ' + comments.length + '/' + totalCommentCount);
-							console.log('[评论采集] 🤖 启动自动滚动');
-							startAutoScroll(totalCommentCount);
-						} else if (totalCommentCount === 0) {
-							console.log('[评论采集] 💡 未知总数，尝试滚动加载 (当前: ' + comments.length + ')');
-							startAutoScroll(0);
-						} else if (totalCommentCount > 0 && comments.length >= totalCommentCount) {
-							console.log('[评论采集] ✅ 评论已完全加载: ' + comments.length + '/' + totalCommentCount);
-						}
-					}
-					
-					// 检查是否已经完成加载（如果正在自动滚动）
-					if (autoScrollEnabled && totalCommentCount > 0 && comments.length >= totalCommentCount) {
-						console.log('[评论采集] ✅ 检测到评论已完全加载，停止自动滚动');
-						stopAutoScroll(true);
-						return;
-					}
-					
-					// 如果正在自动滚动，不要设置延迟保存（等滚动完成后再保存）
-					if (autoScrollEnabled) {
-						console.log('[评论采集] ⏳ 自动滚动中，等待滚动完成后保存...');
-						return; // 跳过延迟保存，等自动滚动完成
-					}
-					
-					// 清除之前的延迟保存定时器
-					if (pendingSaveTimer) {
-						clearTimeout(pendingSaveTimer);
-					}
-					
-					// 延迟保存：等待6秒确保数据稳定
-					console.log('[评论采集] ⏳ 等待6秒后保存...');
-					pendingSaveTimer = setTimeout(function() {
-						// 再次检查签名是否还是一样的
-						var finalComments = [];
-						var finalSignature = '';
-						
-						// 重新获取最新的评论数据
-						try {
-							var rootElements = document.querySelectorAll('[data-v-app], #app, [id*="app"], [class*="app"]');
-							for (var i = 0; i < Math.min(rootElements.length, 3); i++) {
-								var el = rootElements[i];
-								var vueInstance = el.__vue__ || el.__vueParentComponent || el._vnode || el.__vnode;
-								
-								if (vueInstance) {
-									var componentInstance = vueInstance.component || vueInstance;
-									if (componentInstance) {
-										var appContext = componentInstance.appContext || 
-										                (componentInstance.ctx && componentInstance.ctx.appContext);
-										
-										if (appContext && appContext.config && appContext.config.globalProperties) {
-											if (appContext.config.globalProperties.$pinia) {
-												var pinia = appContext.config.globalProperties.$pinia;
-												if (pinia.state && pinia.state._value && pinia.state._value.feed) {
-													var feedStore = pinia.state._value.feed;
-													if (feedStore.commentList && feedStore.commentList.dataList && 
-													    feedStore.commentList.dataList.items) {
-														finalComments = feedStore.commentList.dataList.items;
-														finalSignature = getCommentSignature(finalComments);
-														break;
-													}
-												}
-											}
-										}
-									}
-								}
-							}
-						} catch (e) {
-							console.error('[评论采集] 获取最新评论数据失败:', e);
-						}
-						
-						if (finalComments.length > 0) {
-							console.log('[评论采集] ✓ 数据已稳定，最终评论数:', finalComments.length);
-							console.log('[评论采集] 💾 开始保存...');
-							
-							// 保存最终的评论数据
-							saveCommentData(finalComments, {
-								source: 'store_monitor', 
-								path: storePath,
-								totalCount: totalCommentCount,
-								loadedCount: finalComments.length,
-								isComplete: finalComments.length >= totalCommentCount
-							});
-							
-							// 更新签名
-							lastCommentSignature = finalSignature;
-							lastCommentCount = finalComments.length;
-						}
-						
-						pendingSaveTimer = null;
-					}, 6000); // 6秒延迟
-				} else {
-					// 签名没有变化，增加稳定计数
-					stableCheckCount++;
-					
-					if (storeCheckAttempts === 2) {
-						// 第二次检查时，如果数据没变化，说明监控正常工作
-						if (totalCommentCount > 0 && comments.length < totalCommentCount) {
-							console.log('[评论采集] ✓ 监控正常，已加载', comments.length, '/', totalCommentCount, '条评论');
-						} else {
-							console.log('[评论采集] ✓ 监控正常，等待评论变化...');
-						}
-					}
-					
-					// 如果数据已经稳定5次检查（15秒），且有待保存的数据，立即保存
-					if (stableCheckCount >= 5 && pendingSaveTimer) {
-						console.log('[评论采集] ✓ 数据已稳定15秒，立即保存');
-						clearTimeout(pendingSaveTimer);
-						pendingSaveTimer = null;
-						
-						saveCommentData(comments, {
-							source: 'store_monitor', 
-							path: storePath,
-							totalCount: totalCommentCount,
-							loadedCount: comments.length,
-							isComplete: comments.length >= totalCommentCount
-						});
-						
-						stableCheckCount = 0;
-					}
-				}
-			} else if (storeCheckAttempts <= 5) {
-				// 前5次尝试时输出调试信息
-				console.log('[评论采集] 第', storeCheckAttempts, '次检查，未找到评论Store');
-			}
-			
-			// 如果超过最大尝试次数且没有找到Store，降低检查频率
-			if (storeCheckAttempts > maxStoreCheckAttempts && !foundStore) {
-				console.log('[评论采集] 已尝试', maxStoreCheckAttempts, '次，未找到评论Store，降低检查频率');
-				clearInterval(commentCheckInterval);
-				// 改为每30秒检查一次
-				commentCheckInterval = setInterval(arguments.callee, 30000);
-				storeCheckAttempts = 0; // 重置计数器
-			}
-		}, 3000); // 每3秒检查一次
-	}
-	
-	// 暴露手动启动评论采集的函数
-	window.__wx_channels_start_comment_collection = function() {
-		if (window.location.pathname.includes('/pages/feed')) {
-			console.log('[评论采集] 🚀 手动启动评论采集');
-			startCommentMonitoring();
-		} else {
-			console.log('[评论采集] ⚠️ 当前不是Feed页面，无法采集评论');
-		}
-	};
-	
-	console.log('[评论采集] 评论采集系统初始化完成（手动模式）');
-	console.log('[评论采集] 💡 评论按钮将与下载按钮一起显示');
-})();
-</script>`
-}
-
 // getLogPanelScript 获取日志面板脚本，用于在页面上显示日志（替代控制台）
 func (h *ScriptHandler) getLogPanelScript() string {
 	// 根据配置决定是否显示日志按钮
@@ -3485,9 +1491,17 @@ func (h *ScriptHandler) getLogPanelScript() string {
 		showLogButton = "true"
 	}
 
+	// 根据配置决定是否拦截日志（默认禁用以节省内存）
+	enableLogInterception := "false"
+	if h.getConfig().EnableLogInterception {
+		enableLogInterception = "true"
+	}
+
 	return `<script>
 // 日志按钮显示配置
 window.__wx_channels_show_log_button__ = ` + showLogButton + `;
+// 日志拦截配置（禁用可节省内存）
+window.__wx_channels_enable_log_interception__ = ` + enableLogInterception + `;
 </script>
 <script>
 (function() {
@@ -3499,16 +1513,21 @@ window.__wx_channels_show_log_button__ = ` + showLogButton + `;
 	}
 	window.__wx_channels_log_panel_initialized__ = true;
 	
-	// 日志存储
+	// 日志存储（优化版 - 减少内存占用）
 	const logStore = {
 		logs: [],
-		maxLogs: 500, // 最多保存500条日志
+		maxLogs: 100, // 最多保存100条日志（从500降低）
+		updatePending: false,
+		lastCleanupTime: Date.now(),
+		cleanupInterval: 5 * 60 * 1000, // 每5分钟自动清理一次
+		
 		addLog: function(level, args) {
-			const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+			// 过滤掉过于频繁的日志（防止刷屏）
 			const message = Array.from(args).map(arg => {
 				if (typeof arg === 'object') {
 					try {
-						return JSON.stringify(arg, null, 2);
+						// 限制对象序列化深度，避免大对象占用过多内存
+						return JSON.stringify(arg, this.jsonReplacer, 2);
 					} catch (e) {
 						return String(arg);
 					}
@@ -3516,22 +1535,78 @@ window.__wx_channels_show_log_button__ = ` + showLogButton + `;
 				return String(arg);
 			}).join(' ');
 			
+			// 跳过重复的日志（连续相同的日志只保留一条）
+			if (this.logs.length > 0) {
+				const lastLog = this.logs[this.logs.length - 1];
+				if (lastLog.level === level && lastLog.message === message) {
+					// 更新重复计数
+					lastLog.count = (lastLog.count || 1) + 1;
+					lastLog.timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+					this.scheduleUpdate();
+					return;
+				}
+			}
+			
+			const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
 			this.logs.push({
 				level: level,
 				message: message,
-				timestamp: timestamp
+				timestamp: timestamp,
+				count: 1
 			});
 			
-			// 限制日志数量
+			// 限制日志数量（移除最旧的日志）
 			if (this.logs.length > this.maxLogs) {
 				this.logs.shift();
 			}
 			
-			// 更新面板显示
-			if (window.__wx_channels_log_panel) {
-				window.__wx_channels_log_panel.updateDisplay();
+			// 定期自动清理（防止内存累积）
+			const now = Date.now();
+			if (now - this.lastCleanupTime > this.cleanupInterval) {
+				this.autoCleanup();
+				this.lastCleanupTime = now;
+			}
+			
+			// 批量更新显示（防止频繁DOM操作）
+			this.scheduleUpdate();
+		},
+		
+		// JSON序列化限制器（防止大对象）
+		jsonReplacer: function(key, value) {
+			// 限制字符串长度
+			if (typeof value === 'string' && value.length > 500) {
+				return value.substring(0, 500) + '... (truncated)';
+			}
+			// 限制数组长度
+			if (Array.isArray(value) && value.length > 10) {
+				return value.slice(0, 10).concat(['... (' + (value.length - 10) + ' more items)']);
+			}
+			return value;
+		},
+		
+		// 自动清理旧日志（保留最近50条）
+		autoCleanup: function() {
+			if (this.logs.length > 50) {
+				const removed = this.logs.length - 50;
+				this.logs = this.logs.slice(-50);
+				console.log('[日志面板] 自动清理了 ' + removed + ' 条旧日志');
 			}
 		},
+		
+		// 批量更新显示（防抖）
+		scheduleUpdate: function() {
+			if (this.updatePending) return;
+			this.updatePending = true;
+			
+			// 使用 requestAnimationFrame 批量更新
+			requestAnimationFrame(() => {
+				this.updatePending = false;
+				if (window.__wx_channels_log_panel) {
+					window.__wx_channels_log_panel.updateDisplay();
+				}
+			});
+		},
+		
 		clear: function() {
 			this.logs = [];
 			if (window.__wx_channels_log_panel) {
@@ -3805,9 +1880,11 @@ window.__wx_channels_show_log_button__ = ` + showLogButton + `;
 		content.style.scrollbarWidth = 'thin';
 		content.style.scrollbarColor = '#555 #222';
 		
-		// 更新显示
+		// 更新显示（优化版 - 减少DOM操作）
 		function updateDisplay() {
-			content.innerHTML = '';
+			// 使用 DocumentFragment 批量更新DOM
+			const fragment = document.createDocumentFragment();
+			
 			logStore.logs.forEach(log => {
 				const logItem = document.createElement('div');
 				logItem.style.cssText = 'padding: 4px 8px;' +
@@ -3841,12 +1918,21 @@ window.__wx_channels_show_log_button__ = ` + showLogButton + `;
 						levelPrefix = '[LOG]';
 				}
 				
+				// 显示重复计数
+				const countBadge = log.count > 1 ? 
+					'<span style="background: rgba(255,255,255,0.2); padding: 2px 6px; border-radius: 10px; font-size: 10px; margin-left: 4px;">×' + log.count + '</span>' : '';
+				
 				logItem.innerHTML = '<span style="color: #888; font-size: 10px;">[' + log.timestamp + ']</span>' +
 					'<span style="color: ' + levelColor + '; font-weight: bold; margin: 0 4px;">' + levelPrefix + '</span>' +
+					countBadge +
 					'<span style="color: #fff;">' + escapeHtml(log.message) + '</span>';
 				
-				content.appendChild(logItem);
+				fragment.appendChild(logItem);
 			});
+			
+			// 一次性更新DOM
+			content.innerHTML = '';
+			content.appendChild(fragment);
 			
 			// 自动滚动到底部
 			content.scrollTop = content.scrollHeight;
@@ -3931,31 +2017,40 @@ window.__wx_channels_show_log_button__ = ` + showLogButton + `;
 		debug: console.debug.bind(console)
 	};
 	
-	// 重写console方法
-	console.log = function(...args) {
-		originalConsole.log.apply(console, args);
-		logStore.addLog('log', args);
-	};
+	// 重写console方法（可选 - 根据配置决定是否拦截）
+	// 如果不需要日志面板，可以完全禁用拦截以节省内存
+	const enableLogInterception = window.__wx_channels_enable_log_interception__ || false;
 	
-	console.info = function(...args) {
-		originalConsole.info.apply(console, args);
-		logStore.addLog('info', args);
-	};
-	
-	console.warn = function(...args) {
-		originalConsole.warn.apply(console, args);
-		logStore.addLog('warn', args);
-	};
-	
-	console.error = function(...args) {
-		originalConsole.error.apply(console, args);
-		logStore.addLog('error', args);
-	};
-	
-	console.debug = function(...args) {
-		originalConsole.debug.apply(console, args);
-		logStore.addLog('log', args);
-	};
+	if (enableLogInterception) {
+		console.log = function(...args) {
+			originalConsole.log.apply(console, args);
+			logStore.addLog('log', args);
+		};
+		
+		console.info = function(...args) {
+			originalConsole.info.apply(console, args);
+			logStore.addLog('info', args);
+		};
+		
+		console.warn = function(...args) {
+			originalConsole.warn.apply(console, args);
+			logStore.addLog('warn', args);
+		};
+		
+		console.error = function(...args) {
+			originalConsole.error.apply(console, args);
+			logStore.addLog('error', args);
+		};
+		
+		console.debug = function(...args) {
+			originalConsole.debug.apply(console, args);
+			logStore.addLog('log', args);
+		};
+		
+		console.log('[日志面板] 日志拦截已启用（可能占用内存）');
+	} else {
+		console.log('[日志面板] 日志拦截已禁用（节省内存模式）');
+	}
 	
 	// 创建浮动触发按钮（用于微信浏览器等无法使用快捷键的场景）
 	function createToggleButton() {
